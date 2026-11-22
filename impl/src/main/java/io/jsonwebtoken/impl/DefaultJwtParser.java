@@ -302,7 +302,6 @@ public class DefaultJwtParser extends AbstractParser<Jwt<?, ?>> implements JwtPa
         final byte[] signature = decode(tokenized.getDigest(), "JWS signature");
 
         //re-create the jwt part without the signature.  This is what is needed for signature verification:
-        InputStream payloadStream = null;
         InputStream verificationInput;
         if (jwsHeader.isPayloadEncoded()) {
             int len = tokenized.getProtected().length() + 1 + tokenized.getPayload().length();
@@ -326,10 +325,11 @@ public class DefaultJwtParser extends AbstractParser<Jwt<?, ?>> implements JwtPa
             byte[] data = new byte[buf.remaining()];
             buf.get(data);
             InputStream prefixStream = Streams.of(data);
-            payloadStream = payload.toInputStream();
-            // We wrap the payloadStream here in an UncloseableInputStream to prevent the SequenceInputStream from
-            // closing it since we'll need to rewind/reset it if decompression is enabled
-            verificationInput = new SequenceInputStream(prefixStream, new UncloseableInputStream(payloadStream));
+            // RFC 7797 b64=false: the payload was materialized to a single authoritative byte array earlier
+            // in parsing, so verification reads exactly the bytes represented by this token.  No rewind/reset
+            // of an external stream is necessary (or possible to get wrong), and the same bytes are what the
+            // eventual Jws/claims consumer will receive:
+            verificationInput = new SequenceInputStream(prefixStream, Streams.of(payload.getBytes()));
         }
 
         try {
@@ -352,8 +352,6 @@ public class DefaultJwtParser extends AbstractParser<Jwt<?, ?>> implements JwtPa
                     "trusted.  Another possibility is that the parser was provided the incorrect " +
                     "signature verification key, but this cannot be assumed for security reasons.";
             throw new UnsupportedJwtException(msg, e);
-        } finally {
-            Streams.reset(payloadStream);
         }
 
         return signature;
@@ -479,6 +477,14 @@ public class DefaultJwtParser extends AbstractParser<Jwt<?, ?>> implements JwtPa
                 // otherwise, use the specified payload:
                 payload = unencodedPayload;
             }
+            // RFC 7797 b64=false: the same exact payload bytes must be used for signature verification,
+            // detached-payload representation and the final Jws/claims consumer.  The payload may be backed
+            // by a re-readable or concurrently-mutated InputStream whose pointer or contents can change
+            // between reads, so consume it exactly once in a single bounded transaction and retain the
+            // authoritative byte array.  The source stream is never read again, ensuring short reads, repeat
+            // reads or trailing appends cannot cause verification of one byte sequence while exposing
+            // another:
+            payload = payload.materialize("JWS Unencoded Payload");
         }
 
         if (tokenized instanceof TokenizedJwe && payload.isEmpty()) {

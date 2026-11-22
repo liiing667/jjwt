@@ -23,11 +23,9 @@ import io.jsonwebtoken.JwtBuilder;
 import io.jsonwebtoken.Jwts;
 import io.jsonwebtoken.impl.io.Base64UrlStreamEncoder;
 import io.jsonwebtoken.impl.io.ByteBase64UrlStreamEncoder;
-import io.jsonwebtoken.impl.io.CountingInputStream;
 import io.jsonwebtoken.impl.io.EncodingOutputStream;
 import io.jsonwebtoken.impl.io.NamedSerializer;
 import io.jsonwebtoken.impl.io.Streams;
-import io.jsonwebtoken.impl.io.UncloseableInputStream;
 import io.jsonwebtoken.impl.lang.Bytes;
 import io.jsonwebtoken.impl.lang.Functions;
 import io.jsonwebtoken.impl.lang.Parameter;
@@ -574,53 +572,39 @@ public class DefaultJwtBuilder implements JwtBuilder {
         // ----- payload -----
         // Logic defined by table in https://datatracker.ietf.org/doc/html/rfc7797#section-3 :
         InputStream signingInput;
-        InputStream payloadStream = null; // not needed unless b64 is enabled
         if (this.encodePayload) {
             encodeAndWrite("JWS Payload", payload, jws);
             signingInput = Streams.of(jws.toByteArray());
         } else { // b64
 
-            // First, ensure we have the base64url header bytes + the SEPARATOR_CHAR byte:
+            // RFC 7797 b64=false requires the exact raw payload bytes to be (a) included directly in the
+            // signing input and (b) re-emitted verbatim when the payload is attached (non-detached).  The
+            // payload may originate from a re-readable or concurrently-mutated InputStream whose pointer or
+            // contents can change between reads, so we consume it exactly once in a single bounded
+            // transaction and retain the authoritative bytes.  Every subsequent use (signature calculation,
+            // attached-payload emission, emptiness check) shares that same byte array - the source stream is
+            // never touched again, preventing short reads, repeat reads or trailing appends from substituting
+            // a different sequence of bytes for the one represented by this token:
+            payload = materializeUnencodedPayload(payload);
+            final byte[] rawPayload = payload.getBytes();
+            if (Bytes.isEmpty(rawPayload)) {
+                String msg = "'b64' Unencoded payload option has been specified, but payload is empty.";
+                throw new IllegalStateException(msg);
+            }
+
+            // (base64url header bytes + separator char) + the single authoritative raw payload byte sequence:
             InputStream prefixStream = Streams.of(jws.toByteArray());
-
-            // Next, b64 extension requires the raw (non-encoded) payload to be included directly in the signing input,
-            // so we ensure we have an input stream for that:
-            payloadStream = toInputStream("JWS Unencoded Payload", payload);
-
-            if (!payload.isClaims()) {
-                payloadStream = new CountingInputStream(payloadStream); // we'll need to assert if it's empty later
-            }
-            if (payloadStream.markSupported()) {
-                payloadStream.mark(0); // to rewind
-            }
-
-            // (base64url header bytes + separator char) + raw payload bytes:
-            // and don't let the SequenceInputStream close the payloadStream in case reset is needed:
-            signingInput = new SequenceInputStream(prefixStream, new UncloseableInputStream(payloadStream));
+            signingInput = new SequenceInputStream(prefixStream, Streams.of(rawPayload));
         }
 
-        byte[] signature;
-        try {
-            SecureRequest<InputStream, Key> request = new DefaultSecureRequest<>(signingInput, provider, secureRandom, key);
-            signature = signFunction.apply(request);
+        SecureRequest<InputStream, Key> request = new DefaultSecureRequest<>(signingInput, provider, secureRandom, key);
+        byte[] signature = signFunction.apply(request);
 
-            // now that we've calculated the signature, if using the b64 extension, and the payload is
-            // attached ('non-detached'), we need to include it in the jws before the signature token.
-            // (Note that if encodePayload is true, the payload has already been written to jws at this point, so
-            // we only need to write if encodePayload is false and the payload is attached):
-            if (!this.encodePayload) {
-                if (!payload.isCompressed() // don't print raw compressed bytes
-                        && (payload.isClaims() || payload.isString())) {
-                    // now add the payload to the jws output:
-                    Streams.copy(payloadStream, jws, new byte[8192], "Unable to copy attached Payload InputStream.");
-                }
-                if (payloadStream instanceof CountingInputStream && ((CountingInputStream) payloadStream).getCount() <= 0) {
-                    String msg = "'b64' Unencoded payload option has been specified, but payload is empty.";
-                    throw new IllegalStateException(msg);
-                }
-            }
-        } finally {
-            Streams.reset(payloadStream);
+        if (!this.encodePayload && !payload.isCompressed()) { // don't print raw compressed bytes
+            // Signature was calculated over the materialized bytes above.  If the payload is attached
+            // ('non-detached'), emit the very same authoritative byte sequence into the compact JWS so the
+            // token can never diverge from the bytes that were signed:
+            Streams.write(jws, payload.getBytes(), "Unable to write attached Payload bytes.");
         }
 
         // ----- separator -----
@@ -803,6 +787,27 @@ public class DefaultJwtBuilder implements JwtBuilder {
             // No claims and not compressed, so just get the direct InputStream:
             return Assert.stateNotNull(payload.toInputStream(), "Payload InputStream cannot be null.");
         }
+    }
+
+    /**
+     * Captures the exact RFC 7797 unencoded ({@code b64=false}) payload bytes in a single bounded read
+     * transaction.  Claims and compressed payloads are first serialized/decompressed to a fixed byte array
+     * (as before), and any other payload - including payloads backed by arbitrary, re-readable or
+     * concurrently-mutated {@link InputStream}s - is read exactly once.  The returned {@code Payload} is the
+     * sole source of bytes used for both signature calculation and the compact token's attached payload, so
+     * short reads, repeat reads or trailing appends on the original stream can never cause the emitted token
+     * to represent a different sequence of bytes than the one that was signed.
+     */
+    private Payload materializeUnencodedPayload(Payload payload) {
+        if (payload.isClaims() || payload.isCompressed()) {
+            // serialize claims (or write the already-compressed bytes) to a fixed byte sequence:
+            byte[] data = Streams.bytes(toInputStream("JWS Unencoded Payload", payload),
+                    "Unable to read JWS Unencoded Payload bytes.");
+            Payload materialized = new Payload(data, payload.getContentType());
+            materialized.setClaimsExpected(payload.isClaims());
+            return materialized;
+        }
+        return payload.materialize("JWS Unencoded Payload");
     }
 
     // @since 0.12.7 per https://github.com/jwtk/jjwt/issues/988

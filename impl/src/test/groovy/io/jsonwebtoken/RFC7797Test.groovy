@@ -69,7 +69,7 @@ class RFC7797Test {
 
         String s = Jwts.builder().signWith(key).content(content).encodePayload(false).compact()
 
-        // But verify with 3 types of sources: string, byte array, and two different kinds of InputStreams:
+        // Verify with 3 types of sources: byte array and two different kinds of InputStreams:
         InputStream asByteInputStream = Streams.of(content)
         InputStream asBufferedInputStream = new BufferedInputStream(Streams.of(content))
 
@@ -81,14 +81,10 @@ class RFC7797Test {
             } else {
                 jws = parser.parseSignedContent(s, (InputStream) payload)
             }
-            // When the supplied unencodedPayload is not a byte array or a ByteArrayInputStream, we can't know how
-            // big the payload stream might be, and we don't want to pull it all into memory, so the JWS payload
-            // body will be empty.  So we only assert the payload contents when we can get the bytes:
-            if (payload instanceof byte[] || payload instanceof ByteArrayInputStream) {
-                assertArrayEquals content, jws.getPayload()
-            } else {
-                assertArrayEquals Bytes.EMPTY, jws.getPayload()
-            }
+            // The parser materializes the unencoded payload bytes in a single read transaction, so the
+            // returned JWS payload must always be exactly the bytes that were verified, regardless of the
+            // supplied source type:
+            assertArrayEquals content, jws.getPayload()
         }
     }
 
@@ -131,7 +127,7 @@ class RFC7797Test {
 
         String s = Jwts.builder().signWith(key).content(contentStream).encodePayload(false).compact()
 
-        // But verify with 3 types of sources: byte array, and two different kinds of InputStreams:
+        // Verify with 3 types of sources: byte array and two different kinds of InputStreams:
         InputStream asByteInputStream =Streams.of(content)
         InputStream asBufferedInputStream = new BufferedInputStream(Streams.of(content))
 
@@ -143,21 +139,16 @@ class RFC7797Test {
             } else {
                 jws = parser.parseSignedContent(s, (InputStream) payload)
             }
-            // When the supplied unencodedPayload is not a byte array or a ByteArrayInputStream, we can't know how
-            // big the payload stream might be, and we don't want to pull it all into memory, so the JWS payload
-            // body will be empty.  So we only assert the payload contents when we can get the bytes:
-            if (payload instanceof byte[] || payload instanceof ByteArrayInputStream) {
-                assertArrayEquals content, jws.getPayload()
-            } else {
-                assertArrayEquals Bytes.EMPTY, jws.getPayload()
-            }
+            // Materialized in a single read transaction, the verified JWS payload is always the exact
+            // supplied bytes regardless of source type:
+            assertArrayEquals content, jws.getPayload()
         }
     }
 
     @Test
     void payloadStreamThatDoesNotSupportMark() {
         def key = TestKeys.HS256
-        String s = 'Hello JJWT'
+        String s = 'Hello-JJWT' // compact token bodies may not contain whitespace or period characters
         byte[] data = Strings.utf8(s)
         InputStream stream = new ByteArrayInputStream(data) {
             @Override
@@ -174,10 +165,22 @@ class RFC7797Test {
         // compact/sign shouldn't fail, should still compute signature:
         String compact = Jwts.builder().content(stream).signWith(key).encodePayload(false).compact()
 
-        // signature still verified:
+        // signature still verified, and the attached (non-detached) token must carry the exact signed bytes
+        // even though the source stream cannot be rewound via mark/reset:
         def jwt = Jwts.parser().verifyWith(key).build().parseSignedContent(compact, data)
         assertEquals 'HS256', jwt.header.getAlgorithm()
         assertEquals s, Strings.utf8(jwt.getPayload())
+
+        // the compact string itself must embed the full raw payload between its two delimiters:
+        def parts = compact.split('\\.')
+        assertEquals 3, parts.length
+        assertEquals s, parts[1]
+
+        // and normal (non-detached) parsing without an externally supplied payload must succeed over the
+        // very same bytes, proving signature input and attached payload share one read transaction:
+        def parsed = Jwts.parser().verifyWith(key).critical().add(DefaultJwsHeader.B64.id).and().build()
+                .parseSignedContent(compact)
+        assertArrayEquals data, parsed.getPayload()
     }
 
     @Test
@@ -219,6 +222,24 @@ class RFC7797Test {
     void testEmptyBytesPayload() {
         try {
             Jwts.builder().content(Bytes.EMPTY).encodePayload(false).signWith(TestKeys.HS256).compact()
+            fail()
+        } catch (IllegalStateException expected) {
+            String msg = "'b64' Unencoded payload option has been specified, but payload is empty."
+            assertEquals msg, expected.message
+        }
+    }
+
+    @Test
+    void testEmptyInputStreamPayload() {
+        // an InputStream that immediately reaches EOF must be treated exactly like an empty byte[] payload:
+        InputStream emptyStream = new ByteArrayInputStream(Bytes.EMPTY) {
+            @Override
+            boolean markSupported() {
+                return false
+            }
+        }
+        try {
+            Jwts.builder().content(emptyStream).encodePayload(false).signWith(TestKeys.HS256).compact()
             fail()
         } catch (IllegalStateException expected) {
             String msg = "'b64' Unencoded payload option has been specified, but payload is empty."
@@ -358,14 +379,9 @@ class RFC7797Test {
                 } else {
                     jws = parser.parseSignedContent(s, (InputStream) payload)
                 }
-                // When the supplied unencodedPayload is not a byte array or a ByteArrayInputStream, we can't know how
-                // big the payload stream might be, and we don't want to pull it all into memory, so the JWS payload
-                // body will be empty.  So we only assert the payload contents when we can get the bytes:
-                if (payload instanceof byte[] || payload instanceof ByteArrayInputStream) {
-                    assertArrayEquals content, jws.getPayload()
-                } else {
-                    assertArrayEquals Bytes.EMPTY, jws.getPayload()
-                }
+                // The unencoded payload is materialized once before verification and decompression, so the
+                // returned JWS content is always the exact decompressed signed bytes:
+                assertArrayEquals content, jws.getPayload()
             }
         }
     }
@@ -405,5 +421,285 @@ class RFC7797Test {
             String msg = String.format(DefaultJwtParser.B64_DECOMPRESSION_MSG, zip.id)
             assertEquals msg, expected.message
         }
+    }
+
+    /**
+     * An InputStream that re-opens/re-reads its underlying source on each {@code read} cycle and whose
+     * contents can change between reads.  Before the single-transaction fix, the builder signed the first
+     * read's bytes and then emitted whatever a second read returned (potentially empty or appended-to),
+     * producing a token whose attached payload did not match its signature input.
+     */
+    private static class ReusableMutableInputStream extends InputStream {
+        private final byte[][] snapshots
+        private final boolean supportsMark
+        private int snapshotIndex = 0
+        private int pos = 0
+
+        ReusableMutableInputStream(byte[]... snapshots) {
+            this(false, snapshots)
+        }
+
+        ReusableMutableInputStream(boolean supportsMark, byte[]... snapshots) {
+            this.supportsMark = supportsMark
+            this.snapshots = snapshots
+        }
+
+        private byte[] current() {
+            if (snapshotIndex >= snapshots.length) return snapshots[snapshots.length - 1]
+            return snapshots[snapshotIndex]
+        }
+
+        @Override
+        int read() {
+            byte[] data = current()
+            if (pos >= data.length) return -1
+            return data[pos++] & 0xff
+        }
+
+        @Override
+        int read(byte[] b, int off, int len) {
+            byte[] data = current()
+            if (pos >= data.length) return -1
+            int n = Math.min(len, data.length - pos)
+            System.arraycopy(data, pos, b, off, n)
+            pos += n
+            return n
+        }
+
+        @Override
+        boolean markSupported() {
+            return supportsMark
+        }
+
+        @Override
+        void reset() {
+            // simulate a stream that can be retried but serves changed bytes on subsequent reads:
+            snapshotIndex++
+            pos = 0
+        }
+    }
+
+    /**
+     * Simulates a short/partial read followed by EOF on the first read session, while a later re-read would
+     * expose more bytes.  The signed token must reflect only the bytes actually present in the single read
+     * transaction and must never silently mix bytes from a second read.
+     */
+    private static class ShortReadInputStream extends InputStream {
+        private final int firstReadLimit
+        private final byte[] data
+        private int pos = 0
+        private boolean firstRead = true
+
+        ShortReadInputStream(byte[] data, int firstReadLimit) {
+            this.data = data
+            this.firstReadLimit = firstReadLimit
+        }
+
+        @Override
+        int read(byte[] b, int off, int len) {
+            if (pos >= data.length) return -1
+            int effective = len
+            if (firstRead) {
+                effective = Math.min(len, firstReadLimit)
+                firstRead = false
+            }
+            int n = Math.min(effective, data.length - pos)
+            System.arraycopy(data, pos, b, off, n)
+            pos += n
+            return n
+        }
+
+        @Override
+        int read() {
+            if (pos >= data.length) return -1
+            return data[pos++] & 0xff
+        }
+
+        @Override
+        boolean markSupported() {
+            return false
+        }
+    }
+
+    @Test
+    void builderReReadableStreamWithAppendedBytesKeepsOneSignedPayload() {
+
+        def key = TestKeys.HS256
+        // compact-token-safe content (no whitespace/periods):
+        byte[] original = Strings.utf8('dollar-02')
+        byte[] appended = Strings.utf8('dollar-02-extra-trailing-bytes')
+
+        def stream = new ReusableMutableInputStream(original, appended)
+        String compact = Jwts.builder().signWith(key).content(stream).encodePayload(false).compact()
+
+        // the stream was consumed within a single transaction; the compact token must carry the original
+        // bytes verbatim, never the appended bytes from a second read:
+        def parts = compact.split('\\.')
+        assertEquals Strings.utf8(original), parts[1]
+
+        // verification against the original bytes succeeds:
+        def jws = Jwts.parser().verifyWith(key).build().parseSignedContent(compact, original)
+        assertArrayEquals original, jws.getPayload()
+
+        // and the appended bytes must verify NOTHING for this token:
+        try {
+            Jwts.parser().verifyWith(key).build().parseSignedContent(compact, appended)
+            fail('Signature verification must fail for bytes not present in the signing transaction.')
+        } catch (io.jsonwebtoken.security.SignatureException expected) {
+            // expected
+        }
+
+        // attached (non-detached) parsing must also use exactly the bytes embedded in the token:
+        def parsed = Jwts.parser().verifyWith(key).critical().add(DefaultJwsHeader.B64.id).and().build()
+                .parseSignedContent(compact)
+        assertArrayEquals original, parsed.getPayload()
+    }
+
+    @Test
+    void builderShortReadStreamStillProducesSelfConsistentToken() {
+
+        def key = TestKeys.HS256
+        byte[] data = Strings.utf8('short-read-payload')
+
+        // first read() returns only 3 bytes, the rest only on subsequent reads of the same transaction:
+        def stream = new ShortReadInputStream(data, 3)
+        String compact = Jwts.builder().signWith(key).content(stream).encodePayload(false).compact()
+
+        def parts = compact.split('\\.')
+        assertEquals Strings.utf8(data), parts[1]
+
+        def jws = Jwts.parser().verifyWith(key).build().parseSignedContent(compact, data)
+        assertArrayEquals data, jws.getPayload()
+    }
+
+    @Test
+    void builderMarkSupportingStreamWithChangedReReadKeepsSignedPayload() {
+
+        def key = TestKeys.HS256
+        byte[] first = Strings.utf8('first-transaction')
+        byte[] second = Strings.utf8('second-transaction-appended')
+
+        // A mark-supporting stream whose reset() re-opens a source that now serves different bytes.
+        // The legacy implementation signed the first read's bytes, reset, and then copied the second read's
+        // bytes into the attached token, yielding a token whose body did not match its signature input:
+        def stream = new ReusableMutableInputStream(true, first, second)
+        String compact = Jwts.builder().signWith(key).content(stream).encodePayload(false).compact()
+        def parts = compact.split('\\.')
+        assertEquals Strings.utf8(first), parts[1]
+
+        def jws = Jwts.parser().verifyWith(key).build().parseSignedContent(compact, first)
+        assertArrayEquals first, jws.getPayload()
+        try {
+            Jwts.parser().verifyWith(key).build().parseSignedContent(compact, second)
+            fail('Appended bytes from a re-read must never verify against the original signature.')
+        } catch (io.jsonwebtoken.security.SignatureException expected) {
+            // expected
+        }
+    }
+
+    @Test
+    void parserReReadableStreamAlwaysReturnsVerifiedBytes() {
+
+        def key = TestKeys.HS256
+        byte[] original = Strings.utf8('dollar-02')
+        byte[] appended = Strings.utf8('dollar-02-appended')
+
+        String compact = Jwts.builder().signWith(key).content(original).encodePayload(false).compact()
+
+        // A stream that would hand different bytes on a second read must not allow the returned JWS body
+        // to diverge from the bytes that were verified:
+        def stream = new ReusableMutableInputStream(original, appended)
+        def jws = Jwts.parser().verifyWith(key).build().parseSignedContent(compact, stream)
+        assertArrayEquals original, jws.getPayload()
+
+        // and the reverse: verification must fail when the first-transaction bytes themselves don't match:
+        def other = new ReusableMutableInputStream(appended, original)
+        try {
+            Jwts.parser().verifyWith(key).build().parseSignedContent(compact, other)
+            fail('Verification must not succeed when the single-read bytes do not match the signature.')
+        } catch (io.jsonwebtoken.security.SignatureException expected) {
+            // expected
+        }
+    }
+
+    @Test
+    void parserReReadableStreamClaimsAlwaysReturnVerifiedClaims() {
+
+        def key = TestKeys.HS256
+
+        def claims = Jwts.claims().subject('me').build()
+        ByteArrayOutputStream out = new ByteArrayOutputStream()
+        Services.get(Serializer).serialize(claims, out)
+        byte[] content = out.toByteArray()
+
+        String compact = Jwts.builder().signWith(key).content(content).encodePayload(false).compact()
+
+        byte[] tampered = new byte[content.length]
+        System.arraycopy(content, 0, tampered, 0, content.length)
+        tampered[content.length - 1] = (byte) (tampered[content.length - 1] ^ 0x01)
+
+        def stream = new ReusableMutableInputStream(tampered, content)
+        try {
+            Jwts.parser().verifyWith(key).build().parseSignedClaims(compact, stream)
+            fail('Claims must not be returned when the materialized payload fails signature verification.')
+        } catch (io.jsonwebtoken.security.SignatureException expected) {
+            // expected
+        }
+    }
+
+    @Test
+    void binaryAndCrlfPayloadRoundTrip() {
+
+        def key = TestKeys.HS256
+        // binary content including all byte values, CRLF, NULs and 0xff:
+        byte[] content = new byte[512]
+        new Random(0x7797).nextBytes(content)
+        content[0] = (byte) '\r'
+        content[1] = (byte) '\n'
+        content[3] = 0x00
+        content[511] = (byte) 0xff
+
+        // A compact token body may not contain whitespace, so CRLF/binary content must travel as a detached
+        // payload.  Compression also produces a detached token (raw compressed bytes are never embedded), and
+        // exercises the parser's verify-before-decompress single-transaction path:
+        def zip = Jwts.ZIP.GZIP
+        ByteArrayOutputStream compressedOut = new ByteArrayOutputStream()
+        OutputStream cos = zip.compress(compressedOut); cos.write(content); cos.close()
+        byte[] compressed = compressedOut.toByteArray()
+
+        String detached = Jwts.builder().signWith(key).content(new ByteArrayInputStream(content))
+                .encodePayload(false).compressWith(zip).compact()
+        def detachedParts = detached.split('\\.', -1)
+        assertEquals '', detachedParts[1] // detached: no payload embedded in the compact string
+
+        def jws = Jwts.parser().verifyWith(key).build()
+                .parseSignedContent(detached, new ByteArrayInputStream(compressed))
+        assertArrayEquals content, jws.getPayload()
+
+        // a single flipped byte anywhere in the binary content must fail verification:
+        byte[] tampered = compressed.clone()
+        tampered[256 % tampered.length] = (byte) (tampered[256 % tampered.length] ^ 0x01)
+        try {
+            Jwts.parser().verifyWith(key).build()
+                    .parseSignedContent(detached, new ByteArrayInputStream(tampered))
+            fail('Binary payload integrity must be enforced across the full byte range.')
+        } catch (io.jsonwebtoken.security.SignatureException expected) {
+            // expected
+        }
+
+        // attached flow for binary-valued bytes restricted to the compact token's legal ASCII body range
+        // (the compact serializer is character-based, so arbitrary high bytes are reserved for detached use):
+        def legal = ('A'..'Z') + ('a'..'z') + ('0'..'9') + ['-', '_', '~', '!', '$', '&', '*', '=', ';', '@']
+        byte[] attachable = new byte[256]
+        Random rng = new Random(0x7798)
+        for (int i = 0; i < attachable.length; i++) {
+            attachable[i] = (byte) (char) legal[rng.nextInt(legal.size())]
+        }
+        String attached = Jwts.builder().signWith(key).content(attachable).encodePayload(false).compact()
+        def parts = attached.split('\\.', -1)
+        assertEquals Strings.utf8(attachable), parts[1]
+        def parsed = Jwts.parser().verifyWith(key).critical().add(DefaultJwsHeader.B64.id).and().build()
+                .parseSignedContent(attached)
+        assertArrayEquals attachable, parsed.getPayload()
     }
 }

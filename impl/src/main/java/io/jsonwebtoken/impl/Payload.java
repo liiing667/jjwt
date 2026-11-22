@@ -40,6 +40,13 @@ class Payload {
     private final String contentType;
     private CompressionAlgorithm zip;
     private boolean claimsExpected;
+    /**
+     * {@code true} once the payload's backing {@link InputStream} has been consumed within a single read
+     * transaction and its exact bytes captured in {@link #bytes}.  After materialization, the stream is never
+     * read again, so short reads, repeat reads or concurrent appends cannot substitute a different sequence
+     * of bytes for the one associated with this payload (required for RFC 7797 {@code b64=false} JWSs).
+     */
+    private final boolean materialized;
 
     Payload(Claims claims) {
         this(claims, null, null, null, null);
@@ -58,6 +65,11 @@ class Payload {
     }
 
     private Payload(Claims claims, CharSequence string, byte[] bytes, InputStream inputStream, String contentType) {
+        this(claims, string, bytes, inputStream, contentType, false);
+    }
+
+    private Payload(Claims claims, CharSequence string, byte[] bytes, InputStream inputStream, String contentType,
+                    boolean materialized) {
         this.claims = claims;
         this.string = Strings.clean(string);
         this.contentType = Strings.clean(contentType);
@@ -72,6 +84,39 @@ class Payload {
         }
         this.inputStreamEmpty = in == null;
         this.inputStream = this.inputStreamEmpty ? Streams.of(Bytes.EMPTY) : in;
+        this.materialized = materialized;
+    }
+
+    /**
+     * Returns {@code true} if this payload's exact bytes have already been captured during a single bounded
+     * read transaction and must not be read from any (potentially re-readable or mutable) stream again.
+     *
+     * @return {@code true} if the payload bytes are already authoritative and fully held in memory.
+     */
+    boolean isMaterialized() {
+        return this.materialized;
+    }
+
+    /**
+     * Reads the payload's raw content exactly once within a single bounded transaction and returns a new
+     * {@code Payload} whose signature input, detached representation and eventual JWS/claims consumer all
+     * share the same immutable byte array.  The originating {@link InputStream} is never consulted again,
+     * eliminating short-read, repeat-read and trailing-append ambiguity for RFC 7797 {@code b64=false} JWSs.
+     *
+     * @param name descriptive name used in any I/O failure message.
+     * @return a materialized payload backed solely by the bytes read during this transaction.
+     */
+    Payload materialize(String name) {
+        if (isMaterialized() || isClaims()) return this;
+        byte[] data = this.bytes;
+        if (isEmpty() || Bytes.isEmpty(data)) {
+            InputStream in = toInputStream();
+            data = Streams.bytes(in, "Unable to read " + name + " bytes.");
+        }
+        Payload payload = new Payload(this.claims, this.string, data, null, getContentType(), true);
+        payload.setZip(this.zip);
+        payload.setClaimsExpected(this.claimsExpected);
+        return payload;
     }
 
     boolean isClaims() {

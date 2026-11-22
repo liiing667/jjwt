@@ -212,6 +212,25 @@ public class DefaultJwtParser extends AbstractParser<Jwt<?, ?>> implements JwtPa
 
     private final long allowedClockSkewMillis;
 
+    /**
+     * Immutable state used by a single parse invocation.
+     *
+     * <p>Clock readings and expected claim values are intentionally captured once, before the token
+     * is parsed, and then used for all time and expected-claim validation in that invocation.  This
+     * prevents a retry, or a clock whose value changes while parsing, from mixing values from one
+     * parse with claims from another.</p>
+     */
+    private static final class ParseTransaction {
+
+        private final Date now;
+        private final Claims expectedClaims;
+
+        private ParseTransaction(Date now, Claims expectedClaims) {
+            this.now = now;
+            this.expectedClaims = expectedClaims;
+        }
+    }
+
     //SigningKeyResolver will be removed for 1.0:
     @SuppressWarnings("deprecation")
     DefaultJwtParser(Provider provider,
@@ -369,6 +388,14 @@ public class DefaultJwtParser extends AbstractParser<Jwt<?, ?>> implements JwtPa
 
         Assert.notNull(compact, "Compact reader cannot be null.");
         Assert.stateNotNull(unencodedPayload, "internal error: unencodedPayload is null.");
+
+        // Freeze all state that participates in claims validation before inspecting the token.  A
+        // Clock implementation may return a mutable Date, and a caller may retry this token after a
+        // timeout, so retain a private copy for this invocation rather than reading the Clock again
+        // (or using a Date instance that another thread can mutate) during validation.
+        final Date clockNow = this.clock.now();
+        final Date now = new Date(clockNow.getTime());
+        final ParseTransaction transaction = new ParseTransaction(now, this.expectedClaims.build());
 
         final TokenizedJwt tokenized = jwtTokenizer.tokenize(compact);
         final CharSequence base64UrlHeader = tokenized.getProtected();
@@ -667,7 +694,7 @@ public class DefaultJwtParser extends AbstractParser<Jwt<?, ?>> implements JwtPa
         //since 0.3:
         if (claims != null) {
 
-            final Date now = this.clock.now();
+            final Date now = transaction.now;
             long nowTime = now.getTime();
 
             // https://www.rfc-editor.org/rfc/rfc7519.html#section-4.1.4
@@ -675,13 +702,17 @@ public class DefaultJwtParser extends AbstractParser<Jwt<?, ?>> implements JwtPa
             Date exp = claims.getExpiration();
             if (exp != null) {
 
+                long expTime = exp.getTime();
                 long maxTime = nowTime - this.allowedClockSkewMillis;
-                Date max = allowSkew ? new Date(maxTime) : now;
-                if (max.after(exp)) {
-                    String expVal = DateFormats.formatIso8601(exp, true);
+                // With no clock skew, the RFC's "on or after" boundary is strict: an expiration
+                // time equal to the current time is expired.  When a positive skew is configured,
+                // retain the historical inclusive-end behavior at the skew boundary.
+                boolean expired = allowSkew ? maxTime > expTime : nowTime >= expTime;
+                if (expired) {
+                    String expVal = DateFormats.formatIso8601(new Date(expTime), true);
                     String nowVal = DateFormats.formatIso8601(now, true);
 
-                    long differenceMillis = nowTime - exp.getTime();
+                    long differenceMillis = nowTime - expTime;
 
                     String msg = "JWT expired " + differenceMillis + " milliseconds ago at " + expVal + ". " +
                             "Current time: " + nowVal + ". Allowed clock skew: " +
@@ -695,13 +726,14 @@ public class DefaultJwtParser extends AbstractParser<Jwt<?, ?>> implements JwtPa
             Date nbf = claims.getNotBefore();
             if (nbf != null) {
 
+                long nbfTime = nbf.getTime();
                 long minTime = nowTime + this.allowedClockSkewMillis;
-                Date min = allowSkew ? new Date(minTime) : now;
-                if (min.before(nbf)) {
-                    String nbfVal = DateFormats.formatIso8601(nbf, true);
+                boolean premature = allowSkew ? minTime < nbfTime : nowTime < nbfTime;
+                if (premature) {
+                    String nbfVal = DateFormats.formatIso8601(new Date(nbfTime), true);
                     String nowVal = DateFormats.formatIso8601(now, true);
 
-                    long differenceMillis = nbf.getTime() - nowTime;
+                    long differenceMillis = nbfTime - nowTime;
 
                     String msg = "JWT early by " + differenceMillis + " milliseconds before " + nbfVal +
                             ". Current time: " + nowVal + ". Allowed clock skew: " +
@@ -710,7 +742,7 @@ public class DefaultJwtParser extends AbstractParser<Jwt<?, ?>> implements JwtPa
                 }
             }
 
-            validateExpectedClaims(header, claims);
+            validateExpectedClaims(transaction, header, claims);
         }
 
         return jwt;
@@ -726,9 +758,9 @@ public class DefaultJwtParser extends AbstractParser<Jwt<?, ?>> implements JwtPa
         return o;
     }
 
-    private void validateExpectedClaims(Header header, Claims claims) {
+    private void validateExpectedClaims(ParseTransaction transaction, Header header, Claims claims) {
 
-        final Claims expected = expectedClaims.build();
+        final Claims expected = transaction.expectedClaims;
 
         for (String expectedClaimName : expected.keySet()) {
 

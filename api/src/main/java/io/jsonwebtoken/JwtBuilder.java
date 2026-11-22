@@ -1028,6 +1028,10 @@ public interface JwtBuilder extends ClaimsMutator<JwtBuilder> {
      * <a href="https://www.rfc-editor.org/rfc/rfc7519.html#section-7.1">JWT Compact Serialization</a>
      * rules.
      *
+     * <p>Each invocation freezes the builder's current claims, header, key and cryptographic generation before
+     * serialization begins.  Subsequent builder changes (including changes made by another thread during
+     * serialization) apply only to later invocations and cannot change the token returned by this call.</p>
+     *
      * @return A compact URL-safe JWT string.
      */
     String compact();

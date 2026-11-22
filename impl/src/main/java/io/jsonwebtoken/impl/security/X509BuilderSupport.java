@@ -57,6 +57,20 @@ public class X509BuilderSupport implements X509Builder<X509BuilderSupport> {
         this.GET_X509_BYTES = createGetBytesFunction(getBytesFailedException);
     }
 
+    /**
+     * Copies only the deferred X.509 computation state to another support instance.  The header values themselves
+     * are copied independently so a build-time header snapshot cannot be changed by future builder mutations.
+     *
+     * @param src the support instance from which to copy deferred state
+     */
+    public void copyFrom(X509BuilderSupport src) {
+        if (src == null) {
+            return;
+        }
+        this.computeX509Sha1Thumbprint = src.computeX509Sha1Thumbprint;
+        this.computeX509Sha256Thumbprint = src.computeX509Sha256Thumbprint;
+    }
+
     @Override
     public X509BuilderSupport x509Url(URI uri) {
         this.map.put(AbstractAsymmetricJwk.X5U.getId(), uri);

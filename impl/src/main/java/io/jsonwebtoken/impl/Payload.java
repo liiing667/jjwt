@@ -57,6 +57,12 @@ class Payload {
         this(null, null, null, inputStream, contentType);
     }
 
+    Payload(Payload other) {
+        this(other.claims, other.string, other.bytes, other.inputStream, other.contentType);
+        this.zip = other.zip;
+        this.claimsExpected = other.claimsExpected;
+    }
+
     private Payload(Claims claims, CharSequence string, byte[] bytes, InputStream inputStream, String contentType) {
         this.claims = claims;
         this.string = Strings.clean(string);
@@ -92,6 +98,12 @@ class Payload {
 
     public void setZip(CompressionAlgorithm zip) {
         this.zip = zip;
+    }
+
+    Payload withZip(CompressionAlgorithm zip) {
+        Payload copy = new Payload(this);
+        copy.zip = zip;
+        return copy;
     }
 
     boolean isCompressed() {

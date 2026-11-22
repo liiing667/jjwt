@@ -86,6 +86,18 @@ public class DefaultJwtBuilder implements JwtBuilder {
     private static final String PRIV_KEY_ENC_MSG = "PrivateKeys may not be used to encrypt data. PublicKeys are " +
             "used to encrypt, and PrivateKeys are used to decrypt.";
 
+    /**
+     * Guards creation of an issuance snapshot.  A snapshot contains every value that can influence a compact
+     * serialization, so changing this builder after {@link #compact()} begins cannot affect the token being created.
+     */
+    private final Object stateLock = new Object();
+
+    /**
+     * Monotonically increasing issuance identifier.  Each compact call captures one generation and only reads that
+     * generation's snapshot after the lock is released.
+     */
+    private volatile long generation;
+
     protected Provider provider;
     protected SecureRandom secureRandom;
 
@@ -115,6 +127,54 @@ public class DefaultJwtBuilder implements JwtBuilder {
         this.claimsBuilder = new DefaultBuilderClaims(this);
     }
 
+    private static final class BuildState {
+
+        final long generation;
+        final DefaultJwtHeaderBuilder header;
+        final Payload payload;
+        final boolean jwe;
+        final Key key;
+        final Provider keyProvider;
+        final Provider provider;
+        final SecureRandom secureRandom;
+        final SecureDigestAlgorithm<Key, ?> sigAlg;
+        final Function<SecureRequest<InputStream, Key>, byte[]> signFunction;
+        final AeadAlgorithm enc;
+        final KeyAlgorithm<Key, ?> keyAlg;
+        final Function<KeyRequest<Key>, KeyResult> keyAlgFunction;
+        final Serializer<Map<String, ?>> serializer;
+        final Encoder<OutputStream, OutputStream> encoder;
+        final boolean encodePayload;
+        final CompressionAlgorithm compressionAlgorithm;
+
+        BuildState(long generation, DefaultJwtHeaderBuilder header, Payload payload, boolean jwe, Key key,
+                   Provider keyProvider, Provider provider, SecureRandom secureRandom,
+                   SecureDigestAlgorithm<Key, ?> sigAlg,
+                   Function<SecureRequest<InputStream, Key>, byte[]> signFunction,
+                   AeadAlgorithm enc, KeyAlgorithm<Key, ?> keyAlg,
+                   Function<KeyRequest<Key>, KeyResult> keyAlgFunction,
+                   Serializer<Map<String, ?>> serializer, Encoder<OutputStream, OutputStream> encoder,
+                   boolean encodePayload, CompressionAlgorithm compressionAlgorithm) {
+            this.generation = generation;
+            this.header = header;
+            this.payload = payload;
+            this.jwe = jwe;
+            this.key = key;
+            this.keyProvider = keyProvider;
+            this.provider = provider;
+            this.secureRandom = secureRandom;
+            this.sigAlg = sigAlg;
+            this.signFunction = signFunction;
+            this.enc = enc;
+            this.keyAlg = keyAlg;
+            this.keyAlgFunction = keyAlgFunction;
+            this.serializer = serializer;
+            this.encoder = encoder;
+            this.encodePayload = encodePayload;
+            this.compressionAlgorithm = compressionAlgorithm;
+        }
+    }
+
     @Override
     public BuilderHeader header() {
         return this.headerBuilder;
@@ -127,13 +187,17 @@ public class DefaultJwtBuilder implements JwtBuilder {
 
     @Override
     public JwtBuilder provider(Provider provider) {
-        this.provider = provider;
+        synchronized (this.stateLock) {
+            this.provider = provider;
+        }
         return this;
     }
 
     @Override
     public JwtBuilder random(SecureRandom secureRandom) {
-        this.secureRandom = secureRandom;
+        synchronized (this.stateLock) {
+            this.secureRandom = secureRandom;
+        }
         return this;
     }
 
@@ -144,7 +208,9 @@ public class DefaultJwtBuilder implements JwtBuilder {
 
     @Override
     public JwtBuilder json(Serializer<Map<String, ?>> serializer) {
-        this.serializer = Assert.notNull(serializer, "JSON Serializer cannot be null.");
+        synchronized (this.stateLock) {
+            this.serializer = Assert.notNull(serializer, "JSON Serializer cannot be null.");
+        }
         return this;
     }
 
@@ -156,13 +222,17 @@ public class DefaultJwtBuilder implements JwtBuilder {
     @Override
     public JwtBuilder b64Url(Encoder<OutputStream, OutputStream> encoder) {
         Assert.notNull(encoder, "encoder cannot be null.");
-        this.encoder = encoder;
+        synchronized (this.stateLock) {
+            this.encoder = encoder;
+        }
         return this;
     }
 
     @Override
     public JwtBuilder encodePayload(boolean b64) {
-        this.encodePayload = b64;
+        synchronized (this.stateLock) {
+            this.encodePayload = b64;
+        }
         // clear out any previous values. They will be applied appropriately during compact()
         String critParamId = DefaultProtectedHeader.CRIT.getId();
         String b64Id = DefaultJwsHeader.B64.getId();
@@ -236,10 +306,13 @@ public class DefaultJwtBuilder implements JwtBuilder {
             String msg = "The 'none' JWS algorithm cannot be used to sign JWTs.";
             throw new IllegalArgumentException(msg);
         }
-        this.key = key;
-        //noinspection unchecked
-        this.sigAlg = (SecureDigestAlgorithm<Key, ?>) alg;
-        this.signFunction = Functions.wrap(request -> sigAlg.digest(request), SignatureException.class, "Unable to compute %s signature.", id);
+        synchronized (this.stateLock) {
+            this.key = key;
+            //noinspection unchecked
+            this.sigAlg = (SecureDigestAlgorithm<Key, ?>) alg;
+            this.signFunction = Functions.wrap(request -> sigAlg.digest(request), SignatureException.class,
+                    "Unable to compute %s signature.", id);
+        }
         return this;
     }
 
@@ -288,8 +361,8 @@ public class DefaultJwtBuilder implements JwtBuilder {
 
     @Override
     public <K extends Key> JwtBuilder encryptWith(final K key, final KeyAlgorithm<? super K, ?> keyAlg, final AeadAlgorithm enc) {
-        this.enc = Assert.notNull(enc, "Encryption algorithm cannot be null.");
-        Assert.hasText(enc.getId(), "Encryption algorithm id cannot be null or empty.");
+        final AeadAlgorithm aead = Assert.notNull(enc, "Encryption algorithm cannot be null.");
+        Assert.hasText(aead.getId(), "Encryption algorithm id cannot be null or empty.");
 
         Assert.notNull(key, "Encryption key cannot be null.");
         if (key instanceof PrivateKey) {
@@ -298,13 +371,16 @@ public class DefaultJwtBuilder implements JwtBuilder {
         Assert.notNull(keyAlg, "KeyAlgorithm cannot be null.");
         final String algId = Assert.hasText(keyAlg.getId(), "KeyAlgorithm id cannot be null or empty.");
 
-        this.key = key;
-        //noinspection unchecked
-        this.keyAlg = (KeyAlgorithm<Key, ?>) keyAlg;
-        final KeyAlgorithm<Key, ?> alg = this.keyAlg;
+        synchronized (this.stateLock) {
+            this.enc = aead;
+            this.key = key;
+            //noinspection unchecked
+            this.keyAlg = (KeyAlgorithm<Key, ?>) keyAlg;
+            final KeyAlgorithm<Key, ?> alg = this.keyAlg;
 
-        final String cekMsg = "Unable to obtain content encryption key from key management algorithm '%s'.";
-        this.keyAlgFunction = Functions.wrap(alg::getEncryptionKey, SecurityException.class, cekMsg, algId);
+            final String cekMsg = "Unable to obtain content encryption key from key management algorithm '%s'.";
+            this.keyAlgFunction = Functions.wrap(alg::getEncryptionKey, SecurityException.class, cekMsg, algId);
+        }
 
         return this;
     }
@@ -313,7 +389,9 @@ public class DefaultJwtBuilder implements JwtBuilder {
     public JwtBuilder compressWith(CompressionAlgorithm alg) {
         Assert.notNull(alg, "CompressionAlgorithm cannot be null");
         Assert.hasText(alg.getId(), "CompressionAlgorithm id cannot be null or empty.");
-        this.compressionAlgorithm = alg;
+        synchronized (this.stateLock) {
+            this.compressionAlgorithm = alg;
+        }
         // clear out any previous value that might have been there.  It'll be added back to match this
         // specific algorithm in the compact() method implementation
         return header().delete(DefaultHeader.COMPRESSION_ALGORITHM.getId()).and();
@@ -327,7 +405,9 @@ public class DefaultJwtBuilder implements JwtBuilder {
     @Override
     public JwtBuilder content(String content) {
         if (Strings.hasText(content)) {
-            this.payload = new Payload(content, null);
+            synchronized (this.stateLock) {
+                this.payload = new Payload(content, null);
+            }
         }
         return this;
     }
@@ -335,7 +415,9 @@ public class DefaultJwtBuilder implements JwtBuilder {
     @Override
     public JwtBuilder content(byte[] content) {
         if (!Bytes.isEmpty(content)) {
-            this.payload = new Payload(content, null);
+            synchronized (this.stateLock) {
+                this.payload = new Payload(content, null);
+            }
         }
         return this;
     }
@@ -343,7 +425,9 @@ public class DefaultJwtBuilder implements JwtBuilder {
     @Override
     public JwtBuilder content(InputStream in) {
         if (in != null) {
-            this.payload = new Payload(in, null);
+            synchronized (this.stateLock) {
+                this.payload = new Payload(in, null);
+            }
         }
         return this;
     }
@@ -352,7 +436,9 @@ public class DefaultJwtBuilder implements JwtBuilder {
     public JwtBuilder content(byte[] content, String cty) {
         Assert.notEmpty(content, "content byte array cannot be null or empty.");
         Assert.hasText(cty, "Content Type String cannot be null or empty.");
-        this.payload = new Payload(content, cty);
+        synchronized (this.stateLock) {
+            this.payload = new Payload(content, cty);
+        }
         // clear out any previous value - it will be set appropriately during compact()
         return header().delete(DefaultHeader.CONTENT_TYPE.getId()).and();
     }
@@ -361,7 +447,9 @@ public class DefaultJwtBuilder implements JwtBuilder {
     public JwtBuilder content(String content, String cty) throws IllegalArgumentException {
         Assert.hasText(content, "Content string cannot be null or empty.");
         Assert.hasText(cty, "ContentType string cannot be null or empty.");
-        this.payload = new Payload(content, cty);
+        synchronized (this.stateLock) {
+            this.payload = new Payload(content, cty);
+        }
         // clear out any previous value - it will be set appropriately during compact()
         return header().delete(DefaultHeader.CONTENT_TYPE.getId()).and();
     }
@@ -370,7 +458,9 @@ public class DefaultJwtBuilder implements JwtBuilder {
     public JwtBuilder content(InputStream in, String cty) throws IllegalArgumentException {
         Assert.notNull(in, "Payload InputStream cannot be null.");
         Assert.hasText(cty, "ContentType string cannot be null or empty.");
-        this.payload = new Payload(in, cty);
+        synchronized (this.stateLock) {
+            this.payload = new Payload(in, cty);
+        }
         // clear out any previous value - it will be set appropriately during compact()
         return header().delete(DefaultHeader.CONTENT_TYPE.getId()).and();
     }
@@ -467,8 +557,8 @@ public class DefaultJwtBuilder implements JwtBuilder {
         return claims().id(jti).and();
     }
 
-    private void assertPayloadEncoding(String type) {
-        if (!this.encodePayload) {
+    private static void assertPayloadEncoding(boolean encodePayload, String type) {
+        if (!encodePayload) {
             String msg = "Payload encoding may not be disabled for " + type + "s, only JWSs.";
             throw new IllegalArgumentException(msg);
         }
@@ -476,23 +566,35 @@ public class DefaultJwtBuilder implements JwtBuilder {
 
     @Override
     public String compact() {
+        final BuildState state;
+        synchronized (this.stateLock) {
+            state = snapshot();
+        }
+        return compact(state);
+    }
 
+    /**
+     * Freezes all builder state that can participate in a single compact operation.  This method must be invoked
+     * while holding {@link #stateLock}; the returned state is only read after the lock is released.
+     */
+    private BuildState snapshot() {
+        final long generation = ++this.generation;
         final boolean jwe = this.enc != null;
 
-        if (jwe && signFunction != null) {
+        if (jwe && this.signFunction != null) {
             String msg = "Both 'signWith' and 'encryptWith' cannot be specified. Choose either one.";
             throw new IllegalStateException(msg);
         }
 
-        Payload payload = Assert.stateNotNull(this.payload, "Payload instance null, internal error");
+        final Payload statePayload = Assert.stateNotNull(this.payload, "Payload instance null, internal error");
         final Claims claims = this.claimsBuilder.build();
 
-        if (jwe && payload.isEmpty() && Collections.isEmpty(claims)) { // JWE payload can never be empty:
+        if (jwe && statePayload.isEmpty() && Collections.isEmpty(claims)) { // JWE payload can never be empty:
             String msg = "Encrypted JWTs must have either 'claims' or non-empty 'content'.";
             throw new IllegalStateException(msg);
         } // otherwise JWS and Unprotected JWT payloads can be empty
 
-        if (!payload.isEmpty() && !Collections.isEmpty(claims)) {
+        if (!statePayload.isEmpty() && !Collections.isEmpty(claims)) {
             throw new IllegalStateException("Both 'content' and 'claims' cannot be specified. Choose either one.");
         }
 
@@ -501,45 +603,80 @@ public class DefaultJwtBuilder implements JwtBuilder {
             json(Services.get(Serializer.class));
         }
 
+        Payload payload = statePayload;
         if (!Collections.isEmpty(claims)) { // normalize so we have one object to deal with:
             payload = new Payload(claims);
         }
+        final CompressionAlgorithm compressionAlgorithm = this.compressionAlgorithm;
         if (compressionAlgorithm != null && !payload.isEmpty()) {
-            payload.setZip(compressionAlgorithm);
-            this.headerBuilder.put(DefaultHeader.COMPRESSION_ALGORITHM.getId(), compressionAlgorithm.getId());
+            payload = payload.withZip(compressionAlgorithm);
         }
 
+        // Work against a header snapshot so generated values (alg, enc, b64, zip, cty, epk, etc.) are part of only
+        // this issuance and are never retained by the template builder after success or failure.
+        final DefaultJwtHeaderBuilder header = this.headerBuilder.snapshot();
+        if (compressionAlgorithm != null && !payload.isEmpty()) {
+            header.put(DefaultHeader.COMPRESSION_ALGORITHM.getId(), compressionAlgorithm.getId());
+        }
         if (Strings.hasText(payload.getContentType())) {
-            // We retain the value from the content* calls to prevent accidental removal from
-            // header().empty() or header().delete calls
-            this.headerBuilder.contentType(payload.getContentType());
+            // Apply the content* value to this issuance only.  The payload retains it, so header().empty() or
+            // header().delete calls cannot accidentally remove it from a future compact operation.
+            header.contentType(payload.getContentType());
         }
 
         Provider keyProvider = ProviderKey.getProvider(this.key, this.provider);
         Key key = ProviderKey.getKey(this.key);
+
+        //noinspection unchecked
+        return new BuildState(
+                generation,
+                header,
+                payload,
+                jwe,
+                key,
+                keyProvider,
+                this.provider,
+                this.secureRandom,
+                this.sigAlg,
+                this.signFunction,
+                this.enc,
+                this.keyAlg,
+                this.keyAlgFunction,
+                this.serializer,
+                this.encoder,
+                this.encodePayload,
+                compressionAlgorithm
+        );
+    }
+
+    private String compact(BuildState state) {
+        final boolean jwe = state.jwe;
+        final Key key = state.key;
         if (jwe) {
-            return encrypt(payload, key, keyProvider);
+            return encrypt(state);
         } else if (key != null) {
-            return sign(payload, key, keyProvider);
+            return sign(state);
         } else {
-            return unprotected(payload);
+            return unprotected(state);
         }
     }
 
     // automatically closes the OutputStream
-    private void writeAndClose(String name, Map<String, ?> map, OutputStream out) {
+    private void writeAndClose(String name, Map<String, ?> map, OutputStream out,
+                               Serializer<Map<String, ?>> serializer) {
         try {
-            Serializer<Map<String, ?>> named = new NamedSerializer(name, this.serializer);
+            Serializer<Map<String, ?>> named = new NamedSerializer(name, serializer);
             named.serialize(map, out);
         } finally {
             Objects.nullSafeClose(out);
         }
     }
 
-    private void writeAndClose(String name, final Payload payload, OutputStream out) {
+    private void writeAndClose(String name, final Payload payload, OutputStream out,
+                               Serializer<Map<String, ?>> serializer) {
         out = payload.compress(out); // compression if necessary
         if (payload.isClaims()) {
-            writeAndClose(name, payload.getRequiredClaims(), out);
+            writeAndClose(name, payload.getRequiredClaims(), out, serializer);
         } else {
             try {
                 InputStream in = payload.toInputStream();
@@ -550,7 +687,13 @@ public class DefaultJwtBuilder implements JwtBuilder {
         }
     }
 
-    private String sign(final Payload payload, final Key key, final Provider provider) {
+    private String sign(BuildState state) {
+
+        final Payload payload = state.payload;
+        final Key key = state.key;
+        final SecureDigestAlgorithm<Key, ?> sigAlg = state.sigAlg;
+        final Function<SecureRequest<InputStream, Key>, byte[]> signFunction = state.signFunction;
+        final DefaultJwtHeaderBuilder headerBuilder = state.header;
 
         Assert.stateNotNull(key, "Key is required."); // set by signWithWith*
         Assert.stateNotNull(sigAlg, "SignatureAlgorithm is required."); // invariant
@@ -560,13 +703,13 @@ public class DefaultJwtBuilder implements JwtBuilder {
         final ByteArrayOutputStream jws = new ByteArrayOutputStream(4096);
 
         // ----- header -----
-        this.headerBuilder.add(DefaultHeader.ALGORITHM.getId(), sigAlg.getId());
-        if (!this.encodePayload) { // b64 extension:
+        headerBuilder.add(DefaultHeader.ALGORITHM.getId(), sigAlg.getId());
+        if (!state.encodePayload) { // b64 extension:
             String id = DefaultJwsHeader.B64.getId();
-            this.headerBuilder.critical().add(id).and().add(id, false);
+            headerBuilder.critical().add(id).and().add(id, false);
         }
-        final JwsHeader header = Assert.isInstanceOf(JwsHeader.class, this.headerBuilder.build());
-        encodeAndWrite("JWS Protected Header", header, jws);
+        final JwsHeader header = Assert.isInstanceOf(JwsHeader.class, headerBuilder.build());
+        encodeAndWrite(state, "JWS Protected Header", header, jws);
 
         // ----- separator -----
         jws.write(DefaultJwtParser.SEPARATOR_CHAR);
@@ -575,8 +718,8 @@ public class DefaultJwtBuilder implements JwtBuilder {
         // Logic defined by table in https://datatracker.ietf.org/doc/html/rfc7797#section-3 :
         InputStream signingInput;
         InputStream payloadStream = null; // not needed unless b64 is enabled
-        if (this.encodePayload) {
-            encodeAndWrite("JWS Payload", payload, jws);
+        if (state.encodePayload) {
+            encodeAndWrite(state, "JWS Payload", payload, jws);
             signingInput = Streams.of(jws.toByteArray());
         } else { // b64
 
@@ -585,7 +728,7 @@ public class DefaultJwtBuilder implements JwtBuilder {
 
             // Next, b64 extension requires the raw (non-encoded) payload to be included directly in the signing input,
             // so we ensure we have an input stream for that:
-            payloadStream = toInputStream("JWS Unencoded Payload", payload);
+            payloadStream = toInputStream(state, "JWS Unencoded Payload", payload);
 
             if (!payload.isClaims()) {
                 payloadStream = new CountingInputStream(payloadStream); // we'll need to assert if it's empty later
@@ -601,14 +744,15 @@ public class DefaultJwtBuilder implements JwtBuilder {
 
         byte[] signature;
         try {
-            SecureRequest<InputStream, Key> request = new DefaultSecureRequest<>(signingInput, provider, secureRandom, key);
+            SecureRequest<InputStream, Key> request =
+                    new DefaultSecureRequest<>(signingInput, state.provider, state.secureRandom, key);
             signature = signFunction.apply(request);
 
             // now that we've calculated the signature, if using the b64 extension, and the payload is
             // attached ('non-detached'), we need to include it in the jws before the signature token.
             // (Note that if encodePayload is true, the payload has already been written to jws at this point, so
             // we only need to write if encodePayload is false and the payload is attached):
-            if (!this.encodePayload) {
+            if (!state.encodePayload) {
                 if (!payload.isCompressed() // don't print raw compressed bytes
                         && (payload.isClaims() || payload.isString())) {
                     // now add the payload to the jws output:
@@ -627,29 +771,31 @@ public class DefaultJwtBuilder implements JwtBuilder {
         jws.write(DefaultJwtParser.SEPARATOR_CHAR);
 
         // ----- signature -----
-        encodeAndWrite("JWS Signature", signature, jws);
+        encodeAndWrite(state, "JWS Signature", signature, jws);
 
         return Strings.utf8(jws.toByteArray());
     }
 
-    private String unprotected(final Payload content) {
+    private String unprotected(BuildState state) {
 
+        final Payload content = state.payload;
         Assert.stateNotNull(content, "Content argument cannot be null.");
-        assertPayloadEncoding("unprotected JWT");
+        assertPayloadEncoding(state.encodePayload, "unprotected JWT");
 
-        this.headerBuilder.add(DefaultHeader.ALGORITHM.getId(), Jwts.SIG.NONE.getId());
+        final DefaultJwtHeaderBuilder headerBuilder = state.header;
+        headerBuilder.add(DefaultHeader.ALGORITHM.getId(), Jwts.SIG.NONE.getId());
 
         final ByteArrayOutputStream jwt = new ByteArrayOutputStream(512);
 
         // ----- header -----
-        final Header header = this.headerBuilder.build();
-        encodeAndWrite("JWT Header", header, jwt);
+        final Header header = headerBuilder.build();
+        encodeAndWrite(state, "JWT Header", header, jwt);
 
         // ----- separator -----
         jwt.write(DefaultJwtParser.SEPARATOR_CHAR);
 
         // ----- payload -----
-        encodeAndWrite("JWT Payload", content, jwt);
+        encodeAndWrite(state, "JWT Payload", content, jwt);
 
         // ----- period terminator -----
         jwt.write(DefaultJwtParser.SEPARATOR_CHAR); // https://www.rfc-editor.org/rfc/rfc7519#section-6.1
@@ -657,7 +803,7 @@ public class DefaultJwtBuilder implements JwtBuilder {
         return Strings.ascii(jwt.toByteArray());
     }
 
-    private void encrypt(final AeadRequest req, final AeadResult res) throws SecurityException {
+    private void encrypt(final AeadAlgorithm enc, final AeadRequest req, final AeadResult res) throws SecurityException {
         Function<Object, Object> fn = Functions.wrap(o -> {
             enc.encrypt(req, res);
             return null;
@@ -665,21 +811,29 @@ public class DefaultJwtBuilder implements JwtBuilder {
         fn.apply(null);
     }
 
-    private String encrypt(final Payload content, final Key key, final Provider keyProvider) {
+    private String encrypt(BuildState state) {
+
+        final Payload content = state.payload;
+        final Key key = state.key;
+        final AeadAlgorithm enc = state.enc;
+        final KeyAlgorithm<Key, ?> keyAlg = state.keyAlg;
+        final Function<KeyRequest<Key>, KeyResult> keyAlgFunction = state.keyAlgFunction;
+        final DefaultJwtHeaderBuilder headerBuilder = state.header;
 
         Assert.stateNotNull(content, "Payload argument cannot be null.");
         Assert.stateNotNull(key, "Key is required."); // set by encryptWith*
         Assert.stateNotNull(enc, "Encryption algorithm is required."); // set by encryptWith*
         Assert.stateNotNull(keyAlg, "KeyAlgorithm is required."); //set by encryptWith*
         Assert.stateNotNull(keyAlgFunction, "KeyAlgorithm function cannot be null.");
-        assertPayloadEncoding("JWE");
+        assertPayloadEncoding(state.encodePayload, "JWE");
 
-        InputStream plaintext = toInputStream("JWE Payload", content);
+        InputStream plaintext = toInputStream(state, "JWE Payload", content);
 
         //only expose (mutable) JweHeader functionality to KeyAlgorithm instances, not the full headerBuilder
         // (which exposes this JwtBuilder and shouldn't be referenced by KeyAlgorithms):
-        JweHeader delegate = new DefaultMutableJweHeader(this.headerBuilder);
-        KeyRequest<Key> keyRequest = new DefaultKeyRequest<>(key, keyProvider, this.secureRandom, delegate, enc);
+        JweHeader delegate = new DefaultMutableJweHeader(headerBuilder);
+        KeyRequest<Key> keyRequest =
+                new DefaultKeyRequest<>(key, state.keyProvider, state.secureRandom, delegate, enc);
         KeyResult keyResult = keyAlgFunction.apply(keyRequest);
         Assert.stateNotNull(keyResult, "KeyAlgorithm must return a KeyResult.");
 
@@ -687,15 +841,15 @@ public class DefaultJwtBuilder implements JwtBuilder {
         byte[] encryptedCek = Assert.notNull(keyResult.getPayload(),
                 "KeyResult must return an encrypted key byte array, even if empty.");
 
-        this.headerBuilder.add(DefaultHeader.ALGORITHM.getId(), keyAlg.getId());
-        this.headerBuilder.put(DefaultJweHeader.ENCRYPTION_ALGORITHM.getId(), enc.getId());
+        headerBuilder.add(DefaultHeader.ALGORITHM.getId(), keyAlg.getId());
+        headerBuilder.put(DefaultJweHeader.ENCRYPTION_ALGORITHM.getId(), enc.getId());
 
-        final JweHeader header = Assert.isInstanceOf(JweHeader.class, this.headerBuilder.build(),
+        final JweHeader header = Assert.isInstanceOf(JweHeader.class, headerBuilder.build(),
                 "Invalid header created: ");
 
         // ----- header -----
         ByteArrayOutputStream jwe = new ByteArrayOutputStream(8192);
-        encodeAndWrite("JWE Protected Header", header, jwe);
+        encodeAndWrite(state, "JWE Protected Header", header, jwe);
 
         // JWE RFC requires AAD to be the ASCII bytes of the Base64URL-encoded header. Since the header bytes are
         // already Base64URL-encoded at this point (via the encoder.wrap call just above), and Base64Url-encoding uses
@@ -708,25 +862,25 @@ public class DefaultJwtBuilder implements JwtBuilder {
         // As such, the provider here is intentionally omitted (null):
         // TODO: add encProvider(Provider) builder method that applies to this request only?
         ByteArrayOutputStream ciphertextOut = new ByteArrayOutputStream(8192);
-        AeadRequest req = new DefaultAeadRequest(plaintext, null, secureRandom, cek, aad);
+        AeadRequest req = new DefaultAeadRequest(plaintext, null, state.secureRandom, cek, aad);
         DefaultAeadResult res = new DefaultAeadResult(ciphertextOut);
-        encrypt(req, res);
+        encrypt(enc, req, res);
 
         byte[] iv = Assert.notEmpty(res.getIv(), "Encryption result must have a non-empty initialization vector.");
         byte[] tag = Assert.notEmpty(res.getDigest(), "Encryption result must have a non-empty authentication tag.");
         byte[] ciphertext = Assert.notEmpty(ciphertextOut.toByteArray(), "Encryption result must have non-empty ciphertext.");
 
         jwe.write(DefaultJwtParser.SEPARATOR_CHAR);
-        encodeAndWrite("JWE Encrypted CEK", encryptedCek, jwe);
+        encodeAndWrite(state, "JWE Encrypted CEK", encryptedCek, jwe);
 
         jwe.write(DefaultJwtParser.SEPARATOR_CHAR);
-        encodeAndWrite("JWE Initialization Vector", iv, jwe);
+        encodeAndWrite(state, "JWE Initialization Vector", iv, jwe);
 
         jwe.write(DefaultJwtParser.SEPARATOR_CHAR);
-        encodeAndWrite("JWE Ciphertext", ciphertext, jwe);
+        encodeAndWrite(state, "JWE Ciphertext", ciphertext, jwe);
 
         jwe.write(DefaultJwtParser.SEPARATOR_CHAR);
-        encodeAndWrite("JWE AAD Tag", tag, jwe);
+        encodeAndWrite(state, "JWE AAD Tag", tag, jwe);
 
         return Strings.utf8(jwe.toByteArray());
     }
@@ -769,35 +923,42 @@ public class DefaultJwtBuilder implements JwtBuilder {
             return this.DELEGATE.get(param);
         }
 
+        private DefaultJwtHeaderBuilder snapshot() {
+            DefaultJwtHeaderBuilder copy = new DefaultJwtHeaderBuilder();
+            copy.putAll(this.DELEGATE); // copy values, not the mutable delegate map
+            copy.x509.copyFrom(this.x509); // preserve deferred X.509 thumbprint calculation flags
+            return copy;
+        }
+
         private Header build() {
-            return new DefaultJwtHeaderBuilder(this).build();
+            return snapshot().build();
         }
     }
 
-    private OutputStream encode(OutputStream out, String name) {
-        out = this.encoder.encode(out);
+    private OutputStream encode(BuildState state, OutputStream out, String name) {
+        out = state.encoder.encode(out);
         return new EncodingOutputStream(out, "base64url", name);
     }
 
-    private void encodeAndWrite(String name, Map<String, ?> map, OutputStream out) {
-        out = encode(out, name);
-        writeAndClose(name, map, out);
+    private void encodeAndWrite(BuildState state, String name, Map<String, ?> map, OutputStream out) {
+        out = encode(state, out, name);
+        writeAndClose(name, map, out, state.serializer);
     }
 
-    private void encodeAndWrite(String name, Payload payload, OutputStream out) {
-        out = encode(out, name);
-        writeAndClose(name, payload, out);
+    private void encodeAndWrite(BuildState state, String name, Payload payload, OutputStream out) {
+        out = encode(state, out, name);
+        writeAndClose(name, payload, out, state.serializer);
     }
 
-    private void encodeAndWrite(String name, byte[] data, OutputStream out) {
-        out = encode(out, name);
+    private void encodeAndWrite(BuildState state, String name, byte[] data, OutputStream out) {
+        out = encode(state, out, name);
         Streams.writeAndClose(out, data, "Unable to write bytes");
     }
 
-    private InputStream toInputStream(final String name, Payload payload) {
+    private InputStream toInputStream(BuildState state, final String name, Payload payload) {
         if (payload.isClaims() || payload.isCompressed()) {
             ByteArrayOutputStream claimsOut = new ByteArrayOutputStream(8192);
-            writeAndClose(name, payload, claimsOut);
+            writeAndClose(name, payload, claimsOut, state.serializer);
             return Streams.of(claimsOut.toByteArray());
         } else {
             // No claims and not compressed, so just get the direct InputStream:

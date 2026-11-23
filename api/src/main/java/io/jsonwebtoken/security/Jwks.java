@@ -17,6 +17,7 @@ package io.jsonwebtoken.security;
 
 import io.jsonwebtoken.Identifiable;
 import io.jsonwebtoken.io.Parser;
+import io.jsonwebtoken.lang.Assert;
 import io.jsonwebtoken.lang.Classes;
 import io.jsonwebtoken.lang.Registry;
 
@@ -60,6 +61,8 @@ public final class Jwks {
     // @since 0.12.7 per https://github.com/jwtk/jjwt/issues/988
     private static final Supplier<JwkSetParserBuilder> SET_PARSER_BUILDER_SUPPLIER =
             Classes.newInstance("io.jsonwebtoken.impl.security.DefaultJwkSetParserBuilder$Supplier");
+
+    private static final String JWK_SET_LOCATOR_FQCN = "io.jsonwebtoken.impl.security.DefaultJwkSetLocator";
 
     /**
      * Return a new JWK builder instance, allowing for type-safe JWK builder coercion based on a specified key or key pair.
@@ -118,6 +121,47 @@ public final class Jwks {
      */
     public static JwkSetParserBuilder setParser() {
         return SET_PARSER_BUILDER_SUPPLIER.get();
+    }
+
+    /**
+     * Returns a {@link JwkSetLocator} that locates signature-verification and decryption keys from the JWKs
+     * contained in the specified {@code set}, enforcing each JWK's
+     * <a href="https://www.rfc-editor.org/rfc/rfc7517.html#section-4.3">{@code key_ops}</a> declarations as part
+     * of every key lookup. The returned locator is safe to configure on a
+     * {@link io.jsonwebtoken.JwtParserBuilder#keyLocator(io.jsonwebtoken.Locator) JwtParserBuilder}.
+     *
+     * <p>JWKs without a {@code key_ops} parameter remain usable for every operation for backwards compatibility.
+     * JWKs that declare operations are returned only when the encountered JWS or JWE requires an operation that
+     * the JWK explicitly allows. If no JWK in the set is authorized for the required operation, an
+     * {@link InvalidKeyException} identifying the key and rejected operation is thrown.</p>
+     *
+     * @param set the immutable JWK Set to inspect during key lookup.
+     * @return a {@link JwkSetLocator} backed by the specified {@code set}.
+     * @see #setLocator(Supplier)
+     * @since 0.14.0
+     */
+    public static JwkSetLocator setLocator(JwkSet set) {
+        return Classes.invokeStatic(JWK_SET_LOCATOR_FQCN, "of", new Class[]{JwkSet.class},
+                Assert.notNull(set, "JwkSet cannot be null."));
+    }
+
+    /**
+     * Returns a {@link JwkSetLocator} that obtains the JWK Set to inspect from the specified
+     * {@code setSupplier} on every key {@link io.jsonwebtoken.Locator#locate(io.jsonwebtoken.Header) lookup}.
+     *
+     * <p>The supplier is invoked fresh for each JWS verification or JWE decryption, so refreshed or rotated
+     * JWK Sets (for example re-fetched from a remote endpoint) are reflected immediately. Because no resolved
+     * key or granted operation is cached across lookups, an operation allowed for one key can never be
+     * inadvertently reused for a different key after the set changes.</p>
+     *
+     * @param setSupplier supplies the JWK Set to inspect for each individual key lookup.
+     * @return a {@link JwkSetLocator} backed by the specified supplier.
+     * @see #setLocator(JwkSet)
+     * @since 0.14.0
+     */
+    public static JwkSetLocator setLocator(Supplier<JwkSet> setSupplier) {
+        return Classes.invokeStatic(JWK_SET_LOCATOR_FQCN, "of", new Class[]{Supplier.class},
+                Assert.notNull(setSupplier, "JwkSet supplier cannot be null."));
     }
 
     /**

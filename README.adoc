@@ -3182,6 +3182,42 @@ As shown above, you can specify a custom JCA Provider, <<json,JSON deserializer>
 same way as the `JwkSetBuilder`. Any JWK that does not match the default (or configured) policy will be
 rejected. You can create a policy to override the default if desired using the `Jwks.OP.policy()` builder method.
 
++++<a name="jwkset-locator">++++++</a>+++
+
+=== Use a JWK Set to locate parser keys
+
+When parsing a JWS or JWE, the parser must obtain the key to verify the signature or decrypt the content.
+`Jwks.setLocator(JwkSet)` creates a `JwkSetLocator` that finds the relevant JWK based on the JWT `kid`
+header and enforces each JWK's `key_ops` declaration as part of every lookup:
+
+[,java]
+----
+JwkSet jwkSet = Jwks.setParser().build().parse(json);
+
+JwtParser parser = Jwts.parser()
+    .keyLocator(Jwks.setLocator(jwkSet))
+    .build();
+----
+
+A JWK that declares operations is returned only if it explicitly allows the operation required by the
+encountered JWS or JWE (`verify` for a JWS; `decrypt` for direct JWE key management such as `dir` or
+`ECDH-ES`; `unwrapKey` for JWE key-wrapping algorithms). For example, a JWK declaring only
+`encrypt`/`decrypt` will never be used to verify a JWS signature. JWKs without a `key_ops` parameter remain
+usable for every operation for backwards compatibility. If no JWK is authorized for the required operation,
+an `InvalidKeyException` is thrown that identifies the JWK (by its `kid` when present) and the rejected
+operation.
+
+If the JWK Set may be rotated or refreshed (for example re-fetched from a remote endpoint), use the
+`Jwks.setLocator(Supplier<JwkSet>)` factory instead. The supplier is invoked on every key lookup and no key
+or granted operation is cached between lookups, so a refreshed set takes effect immediately:
+
+[,java]
+----
+JwtParser parser = Jwts.parser()
+    .keyLocator(Jwks.setLocator(() -> fetchLatestJwkSet())) // consulted per parse
+    .build();
+----
+
 +++<a name="compression">++++++</a>+++
 
 == Compression

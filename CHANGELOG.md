@@ -4,6 +4,27 @@
 
 The first JJWT release that uses Java 8+ features.  This release is not strictly backwards compatible and will also not work with Java 7.
 
+#### Security Enhancements
+
+- JWK Set-based key lookup is now an operation-aware authorization transaction. The new
+ `io.jsonwebtoken.security.JwkSetLocator` (created via `Jwks.setLocator(JwkSet)` or
+ `Jwks.setLocator(Supplier<JwkSet>)`) and the `JwtParser` together enforce each JWK's
+ [`key_ops`](https://www.rfc-editor.org/rfc/rfc7517.html#section-4.3) declaration against the actual
+ cryptographic operation being performed:
+  - A JWK that declares only `encrypt`/`decrypt` can no longer be returned or used to verify a JWS
+    signature, and a JWK that declares only `sign`/`verify` can no longer be used for JWE decryption.
+    JWE key-wrapping algorithms require `unwrapKey`, while direct key-management algorithms (`dir`,
+    `ECDH-ES`) require `decrypt`.
+  - JWKs without a `key_ops` parameter remain fully backwards-compatible and are considered authorized
+    for any operation; legal `sign`/`verify`, `encrypt`/`decrypt`, and `wrapKey`/`unwrapKey`
+    combinations continue to work unchanged.
+  - Authorization failures throw an `InvalidKeyException` that identifies the offending JWK (by its
+    `kid` when present) and the rejected operation, rather than surfacing a generic cryptographic
+    failure.
+  - The supplier-based factory consults the JWK Set on every lookup without caching resolved keys or
+    granted operations, so rotating/refreshing a set can never leave a stale operation bound to a
+    different key.
+
 #### Backwards Compatibility Breaking Changes
 
 - The `io.jsonwebtoken.lang.Supplier` interface has been renamed and moved to `io.jsonwebtoken.security.ConfidentialValue` to avoid any potential risk of conflict or accidental use

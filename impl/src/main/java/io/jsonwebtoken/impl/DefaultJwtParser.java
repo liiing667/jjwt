@@ -49,6 +49,7 @@ import io.jsonwebtoken.impl.lang.RedactedConfidentialValue;
 import io.jsonwebtoken.impl.security.DefaultDecryptAeadRequest;
 import io.jsonwebtoken.impl.security.DefaultDecryptionKeyRequest;
 import io.jsonwebtoken.impl.security.DefaultVerifySecureDigestRequest;
+import io.jsonwebtoken.impl.security.KeyOperations;
 import io.jsonwebtoken.impl.security.LocatingKeyResolver;
 import io.jsonwebtoken.impl.security.ProviderKey;
 import io.jsonwebtoken.io.CompressionAlgorithm;
@@ -65,7 +66,9 @@ import io.jsonwebtoken.security.AeadAlgorithm;
 import io.jsonwebtoken.security.DecryptAeadRequest;
 import io.jsonwebtoken.security.DecryptionKeyRequest;
 import io.jsonwebtoken.security.InvalidKeyException;
+import io.jsonwebtoken.security.Jwk;
 import io.jsonwebtoken.security.KeyAlgorithm;
+import io.jsonwebtoken.security.KeyOperation;
 import io.jsonwebtoken.security.SecureDigestAlgorithm;
 import io.jsonwebtoken.security.SignatureException;
 import io.jsonwebtoken.security.VerifySecureDigestRequest;
@@ -266,6 +269,23 @@ public class DefaultJwtParser extends AbstractParser<Jwt<?, ?>> implements JwtPa
         return header != null && Strings.hasText(header.getContentType());
     }
 
+    /**
+     * Binds the key returned by the configured {@link #keyLocator} to the cryptographic operation actually
+     * about to be performed, enforcing any JWK {@code key_ops} declaration. Plain {@link Key} instances
+     * returned by custom locators carry no operation metadata and pass through unchanged (existing key-type
+     * checks still apply); {@link Jwk} instances must explicitly allow the required operation. This is the
+     * single authorization chokepoint shared by both the JWS verification and JWE decryption entry points.
+     *
+     * @param header the encountered JWS or JWE header
+     * @param key    the key located for the header
+     * @return the same key, verified as authorized for the required operation
+     */
+    private Key assertAuthorized(ProtectedHeader header, Key key) {
+        KeyOperation required = KeyOperations.required(header);
+        KeyOperations.assertKeyAuthorized(key, required);
+        return key;
+    }
+
     private byte[] verifySignature(final TokenizedJwt tokenized, final JwsHeader jwsHeader, final String alg,
                                    @SuppressWarnings("deprecation") SigningKeyResolver resolver, Claims claims, Payload payload) {
 
@@ -292,6 +312,8 @@ public class DefaultJwtParser extends AbstractParser<Jwt<?, ?>> implements JwtPa
             String msg = "Cannot verify JWS signature: unable to locate signature verification key for JWS with header: " + jwsHeader;
             throw new UnsupportedJwtException(msg);
         }
+        // enforce JWK key_ops against the actual 'verify' operation before any crypto is attempted:
+        assertAuthorized(jwsHeader, key);
         Provider provider = ProviderKey.getProvider(key, this.provider); // extract if necessary
         key = ProviderKey.getKey(key); // unwrap if necessary, MUST be called after ProviderKey.getProvider
         Assert.stateNotNull(key, "ProviderKey cannot be null."); //ProviderKey impl doesn't allow null
@@ -542,6 +564,8 @@ public class DefaultJwtParser extends AbstractParser<Jwt<?, ?>> implements JwtPa
                 String msg = "Cannot decrypt JWE payload: unable to locate key for JWE with header: " + jweHeader;
                 throw new UnsupportedJwtException(msg);
             }
+            // enforce JWK key_ops against the actual 'decrypt'/'unwrapKey' operation before any crypto:
+            assertAuthorized(jweHeader, key);
             if (key instanceof PublicKey) {
                 throw new InvalidKeyException(PUB_KEY_DECRYPT_MSG);
             }

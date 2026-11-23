@@ -84,6 +84,7 @@ import java.security.Key;
 import java.security.PrivateKey;
 import java.security.Provider;
 import java.security.PublicKey;
+import java.util.AbstractMap;
 import java.util.Collection;
 import java.util.Date;
 import java.util.LinkedHashSet;
@@ -212,6 +213,257 @@ public class DefaultJwtParser extends AbstractParser<Jwt<?, ?>> implements JwtPa
 
     private final long allowedClockSkewMillis;
 
+    /**
+     * Internal signal indicating that a payload that was offered to a legacy {@link SigningKeyResolver} as
+     * {@link Claims} is not actually a Claims JSON object.  It is used to fall back to the resolver's byte[]
+     * callback without ever publishing the staged claims.
+     */
+    private static final class NotClaimsException extends RuntimeException {
+
+        private NotClaimsException() {
+            super("Payload is not a Claims JSON object.", null, false, false);
+        }
+    }
+
+    /**
+     * A single-parse staging area for legacy {@link SigningKeyResolver} invocation and Claims publication.
+     *
+     * <p>Legacy resolvers must be able to inspect Claims to locate a key, but that must not cause an
+     * unverified Claims instance to be handed to the caller or included in an exception.  This type exposes a
+     * lazy, read-only {@link Claims} view to the resolver: the payload is only deserialized if the resolver
+     * actually reads a claim.  The staged Claims are committed only after the signature has been verified.
+     * If the key callback or signature verification fails, {@link #abort()} makes the staged view unusable, so
+     * a resolver that retained the reference cannot later obtain readable claims from a failed transaction.</p>
+     */
+    private static final class ClaimsStaging extends AbstractMap<String, Object> implements Claims {
+
+        private DefaultJwtParser parser;
+        private Payload payload;
+        private final Header header;
+
+        private Claims claims;
+        private byte[] contentBytes;
+        private boolean resolved;
+        private boolean committed;
+        private boolean aborted;
+
+        private ClaimsStaging(DefaultJwtParser parser, Payload payload, Header header) {
+            this.parser = Assert.notNull(parser, "Parser cannot be null.");
+            this.payload = Assert.notNull(payload, "Payload cannot be null.");
+            this.header = Assert.notNull(header, "Header cannot be null.");
+        }
+
+        private void assertActive() {
+            if (this.aborted) {
+                String msg = "Claims are unavailable: the JWT parse transaction did not commit them.";
+                throw new IllegalStateException(msg);
+            }
+        }
+
+        private Claims resolve() {
+
+            if (this.aborted) {
+                assertActive();
+            }
+            if (this.resolved) {
+                return this.claims;
+            }
+
+            DefaultJwtParser parser = this.parser;
+            Payload payload = this.payload;
+            Assert.stateNotNull(parser, "internal error: Claims parser is not available.");
+            Assert.stateNotNull(payload, "internal error: Claims payload is not available.");
+
+            // mark resolved before doing any work so re-entrant access from a custom deserializer cannot
+            // recursively attempt to resolve the same staging area:
+            this.resolved = true;
+
+            if (!payload.isConsumable()) {
+                this.contentBytes = payload.getBytes();
+                return null;
+            }
+
+            InputStream in = null;
+            try {
+                in = payload.toInputStream();
+
+                if (!hasContentType(this.header)) {
+                    Map<String, ?> claimsMap = null;
+                    try {
+                        if (!in.markSupported()) {
+                            in = new BufferedInputStream(in);
+                            in.mark(0);
+                        }
+                        claimsMap = parser.deserialize(new UncloseableInputStream(in), "claims");
+                    } catch (DeserializationException | MalformedJwtException ignored) {
+                        // not JSON, treat it as a byte[]
+                    } finally {
+                        Streams.reset(in);
+                    }
+                    if (claimsMap != null) {
+                        try {
+                            this.claims = new DefaultClaims(claimsMap);
+                        } catch (Throwable t) {
+                            String msg = "Invalid claims: " + t.getMessage();
+                            throw new MalformedJwtException(msg);
+                        }
+                    }
+                }
+                if (this.claims == null) {
+                    this.contentBytes = Streams.bytes(in, "Unable to convert payload to byte array.");
+                }
+            } finally {
+                Objects.nullSafeClose(in);
+            }
+
+            return this.claims;
+        }
+
+        private Claims requireClaims() {
+            assertActive();
+            Claims resolvedClaims = resolve();
+            if (resolvedClaims == null) {
+                throw new NotClaimsException();
+            }
+            return resolvedClaims;
+        }
+
+        /**
+         * Commits this staging area after successful signature verification and returns the Claims instance
+         * that is safe to publish, or {@code null} if the payload is content rather than Claims.
+         *
+         * @return the committed Claims, or {@code null} if the payload is content.
+         */
+        private Claims commit() {
+            assertActive();
+            Claims resolvedClaims = resolve();
+            this.committed = true;
+            // The payload's bytes are no longer needed once the transaction has been resolved and committed.
+            // Releasing them prevents a large raw payload from being retained alongside the Claims it produced.
+            this.parser = null;
+            this.payload = null;
+            return resolvedClaims;
+        }
+
+        /**
+         * Discards any staged Claims after a key lookup or signature verification failure.
+         */
+        private void abort() {
+            this.aborted = true;
+            this.committed = false;
+            this.claims = null;
+            this.contentBytes = null;
+            this.parser = null;
+            this.payload = null;
+        }
+
+        private boolean isResolved() {
+            return this.resolved;
+        }
+
+        private boolean isContent() {
+            return !this.aborted && this.resolved && this.claims == null;
+        }
+
+        private byte[] getContentBytes() {
+            if (this.contentBytes != null) {
+                return this.contentBytes;
+            }
+            Payload payload = this.payload;
+            return payload != null ? payload.getBytes() : Bytes.EMPTY;
+        }
+
+        @Override
+        public String getIssuer() {
+            return requireClaims().getIssuer();
+        }
+
+        @Override
+        public String getSubject() {
+            return requireClaims().getSubject();
+        }
+
+        @Override
+        public Set<String> getAudience() {
+            return requireClaims().getAudience();
+        }
+
+        @Override
+        public Date getExpiration() {
+            return requireClaims().getExpiration();
+        }
+
+        @Override
+        public Date getNotBefore() {
+            return requireClaims().getNotBefore();
+        }
+
+        @Override
+        public Date getIssuedAt() {
+            return requireClaims().getIssuedAt();
+        }
+
+        @Override
+        public String getId() {
+            return requireClaims().getId();
+        }
+
+        @Override
+        public <T> T get(String claimName, Class<T> requiredType) {
+            return requireClaims().get(claimName, requiredType);
+        }
+
+        @Override
+        public int size() {
+            return requireClaims().size();
+        }
+
+        @Override
+        public boolean isEmpty() {
+            return requireClaims().isEmpty();
+        }
+
+        @Override
+        public boolean containsKey(Object key) {
+            return requireClaims().containsKey(key);
+        }
+
+        @Override
+        public boolean containsValue(Object value) {
+            return requireClaims().containsValue(value);
+        }
+
+        @Override
+        public Object get(Object key) {
+            return requireClaims().get(key);
+        }
+
+        @Override
+        public Set<Map.Entry<String, Object>> entrySet() {
+            return requireClaims().entrySet();
+        }
+
+        @Override
+        public Object put(String key, Object value) {
+            throw new UnsupportedOperationException("Claims are immutable.");
+        }
+
+        @Override
+        public Object remove(Object key) {
+            throw new UnsupportedOperationException("Claims are immutable.");
+        }
+
+        @Override
+        public void putAll(Map<? extends String, ?> m) {
+            throw new UnsupportedOperationException("Claims are immutable.");
+        }
+
+        @Override
+        public void clear() {
+            throw new UnsupportedOperationException("Claims are immutable.");
+        }
+    }
+
     //SigningKeyResolver will be removed for 1.0:
     @SuppressWarnings("deprecation")
     DefaultJwtParser(Provider provider,
@@ -266,8 +518,44 @@ public class DefaultJwtParser extends AbstractParser<Jwt<?, ?>> implements JwtPa
         return header != null && Strings.hasText(header.getContentType());
     }
 
+    /**
+     * Returns {@code true} if the payload is structurally a candidate for JSON Claims (a JSON object).
+     *
+     * <p>This deliberately performs only a cheap first-non-whitespace-byte check.  Legacy
+     * {@link SigningKeyResolver} implementations are given a lazy Claims view so a resolver that only needs
+     * the header does not force a large payload to be deserialized before signature verification.</p>
+     */
+    private static boolean isClaimsCandidate(Payload payload, Header header) {
+        if (hasContentType(header)) {
+            return false;
+        }
+        if (Strings.hasText(header.getCompressionAlgorithm())) {
+            // Compressed payloads are decompressed lazily through an InputStream, so the bytes retained by
+            // Payload are the still-compressed bytes and cannot be inspected for a JSON object prefix.  Treat
+            // a consumable payload as a candidate; the staging area will still verify/commit it as content if
+            // it turns out not to be Claims.
+            return payload.isConsumable();
+        }
+        byte[] data = payload.getBytes();
+        if (Bytes.isEmpty(data)) {
+            // A stream whose size is unknown may still represent Claims (for example a detached Claims payload).
+            return payload.isConsumable();
+        }
+        int i = 0;
+        while (i < data.length) {
+            byte b = data[i];
+            if (b == ' ' || b == '\t' || b == '\n' || b == '\r') {
+                i++;
+            } else {
+                break;
+            }
+        }
+        return i < data.length && data[i] == '{';
+    }
+
     private byte[] verifySignature(final TokenizedJwt tokenized, final JwsHeader jwsHeader, final String alg,
-                                   @SuppressWarnings("deprecation") SigningKeyResolver resolver, Claims claims, Payload payload) {
+                                   @SuppressWarnings("deprecation") SigningKeyResolver resolver,
+                                   boolean claimsCandidate, ClaimsStaging staging, Payload payload) {
 
         Assert.notNull(resolver, "SigningKeyResolver instance cannot be null.");
 
@@ -283,8 +571,27 @@ public class DefaultJwtParser extends AbstractParser<Jwt<?, ?>> implements JwtPa
 
         //digitally signed, let's assert the signature:
         Key key;
-        if (claims != null) {
-            key = resolver.resolveSigningKey(jwsHeader, claims);
+        if (claimsCandidate) {
+            Assert.stateNotNull(staging, "Claims staging cannot be null.");
+            try {
+                key = resolver.resolveSigningKey(jwsHeader, staging);
+            } catch (NotClaimsException e) {
+                // The resolver touched the staged Claims and discovered that the payload is content.  Retry
+                // using its content callback with the exact bytes captured by the same transaction.
+                key = resolver.resolveSigningKey(jwsHeader, staging.getContentBytes());
+            } catch (UnsupportedJwtException e) {
+                if (staging.isContent()) {
+                    key = resolver.resolveSigningKey(jwsHeader, staging.getContentBytes());
+                } else if (!staging.isResolved() && staging.resolve() == null) {
+                    // The resolver declined the Claims callback without reading them.  Only now do we pay the
+                    // deserialization cost to determine whether the content callback is the correct fallback.
+                    key = resolver.resolveSigningKey(jwsHeader, staging.getContentBytes());
+                } else {
+                    throw e;
+                }
+            }
+        } else if (staging != null) {
+            key = resolver.resolveSigningKey(jwsHeader, staging.getContentBytes());
         } else {
             key = resolver.resolveSigningKey(jwsHeader, payload.getBytes());
         }
@@ -574,7 +881,8 @@ public class DefaultJwtParser extends AbstractParser<Jwt<?, ?>> implements JwtPa
             // not using a signing key resolver, so we can verify the signature before reading the payload, which is
             // always safer:
             JwsHeader jwsHeader = Assert.stateIsInstance(JwsHeader.class, header, "Not a JwsHeader. ");
-            digest = verifySignature(tokenized, jwsHeader, alg, new LocatingKeyResolver(this.keyLocator), null, payload);
+            digest = verifySignature(tokenized, jwsHeader, alg, new LocatingKeyResolver(this.keyLocator),
+                    false, null, payload);
             integrityVerified = true; // no exception means signature verified
         }
 
@@ -594,7 +902,42 @@ public class DefaultJwtParser extends AbstractParser<Jwt<?, ?>> implements JwtPa
 
         Claims claims = null;
         byte[] payloadBytes = payload.getBytes();
-        if (payload.isConsumable()) {
+        if (hasDigest && signingKeyResolver != null) { // TODO: remove for 1.0
+            JwsHeader jwsHeader = Assert.stateIsInstance(JwsHeader.class, header, "Not a JwsHeader. ");
+
+            // A legacy SigningKeyResolver must be able to inspect Claims before it can return a key, so the
+            // claims/body are staged lazily and are only committed after the signature is verified.  If key
+            // resolution or verification fails, the staging area is aborted and no claims leak out of this
+            // parse attempt (including to a resolver that retained the staged Claims reference).
+            final boolean claimsCandidate = isClaimsCandidate(payload, header);
+            final ClaimsStaging staging = new ClaimsStaging(this, payload, header);
+            try {
+                digest = verifySignature(tokenized, jwsHeader, alg, this.signingKeyResolver, claimsCandidate,
+                        staging, payload);
+                //noinspection UnusedAssignment
+                integrityVerified = true; // no exception means verified successfully
+
+                if (claimsCandidate) {
+                    Claims committed = staging.commit();
+                    if (committed != null) {
+                        // Publish the exact Claims instance that the resolver saw, so the resolver callback, the
+                        // returned Jwt and any subsequent claim-validation exception all share one transaction:
+                        claims = staging;
+                        payloadBytes = payload.getBytes();
+                    } else {
+                        // The resolver callback succeeded via the byte[] overload; publish the transaction's bytes:
+                        payloadBytes = staging.getContentBytes();
+                    }
+                } else {
+                    payloadBytes = staging.getContentBytes();
+                }
+            } catch (RuntimeException | Error t) {
+                staging.abort();
+                throw t;
+            }
+        } else if (payload.isConsumable()) {
+            // No legacy resolver: the signature (if any) has already been verified above, or this is a JWE or
+            // unsecured JWT whose payload is already authenticated.  Only now is it safe to materialize Claims.
             InputStream in = null;
             try {
                 in = payload.toInputStream();
@@ -638,16 +981,6 @@ public class DefaultJwtParser extends AbstractParser<Jwt<?, ?>> implements JwtPa
             } finally { // always ensure closed per https://github.com/jwtk/jjwt/issues/949
                 Objects.nullSafeClose(in);
             }
-        }
-
-        // =============== Post-SKR Signature Check =================
-        if (hasDigest && signingKeyResolver != null) { // TODO: remove for 1.0
-            // A SigningKeyResolver has been configured, and due to it's API, we have to verify the signature after
-            // parsing the body.  This can be a security risk, so it needs to be removed before 1.0
-            JwsHeader jwsHeader = Assert.stateIsInstance(JwsHeader.class, header, "Not a JwsHeader. ");
-            digest = verifySignature(tokenized, jwsHeader, alg, this.signingKeyResolver, claims, payload);
-            //noinspection UnusedAssignment
-            integrityVerified = true; // no exception means verified successfully
         }
 
         Jwt<?, ?> jwt;

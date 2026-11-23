@@ -16,6 +16,7 @@
 package io.jsonwebtoken.security;
 
 import io.jsonwebtoken.Identifiable;
+import io.jsonwebtoken.Jws;
 import io.jsonwebtoken.io.Parser;
 import io.jsonwebtoken.lang.Classes;
 import io.jsonwebtoken.lang.Registry;
@@ -60,6 +61,8 @@ public final class Jwks {
     // @since 0.12.7 per https://github.com/jwtk/jjwt/issues/988
     private static final Supplier<JwkSetParserBuilder> SET_PARSER_BUILDER_SUPPLIER =
             Classes.newInstance("io.jsonwebtoken.impl.security.DefaultJwkSetParserBuilder$Supplier");
+
+    private static final String JWK_SET_LOCATOR_IMPL = "io.jsonwebtoken.impl.security.DefaultJwkSetLocator";
 
     /**
      * Return a new JWK builder instance, allowing for type-safe JWK builder coercion based on a specified key or key pair.
@@ -118,6 +121,33 @@ public final class Jwks {
      */
     public static JwkSetParserBuilder setParser() {
         return SET_PARSER_BUILDER_SUPPLIER.get();
+    }
+
+    /**
+     * Returns a versioned key locator for the specified JWK Set.  The locator can be configured on a
+     * {@link io.jsonwebtoken.JwtParserBuilder#keyLocator(io.jsonwebtoken.Locator) JwtParserBuilder} and
+     * refreshed atomically while the parser is in use:
+     *
+     * <blockquote><pre>
+     * JwkSetLocator locator = Jwks.locator(initialJwkSet);
+     * JwtParser parser = Jwts.parser().keyLocator(locator).build();
+     *
+     * Jws&lt;Claims&gt; first = parser.parseSignedClaims(firstToken);
+     *
+     * locator.refresh(rotatedJwkSet); // complete new generation
+     *
+     * Jws&lt;Claims&gt; second = parser.parseSignedClaims(secondToken);
+     * String fingerprint = second.{@link Jws#getKeyFingerprint() getKeyFingerprint()};</pre></blockquote>
+     *
+     * <p>Each parsed JWS retains the JWK, algorithm, fingerprint and generation that actually verified it.
+     * A failed refresh leaves the previous generation intact.</p>
+     *
+     * @param jwkSet the initial JWK Set generation
+     * @return a versioned key locator for the specified JWK Set
+     * @since 0.14.0
+     */
+    public static JwkSetLocator locator(JwkSet jwkSet) {
+        return Classes.newInstance(JWK_SET_LOCATOR_IMPL, new Class<?>[]{JwkSet.class}, jwkSet);
     }
 
     /**

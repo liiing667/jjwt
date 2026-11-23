@@ -48,6 +48,7 @@ import io.jsonwebtoken.impl.lang.Bytes;
 import io.jsonwebtoken.impl.lang.RedactedConfidentialValue;
 import io.jsonwebtoken.impl.security.DefaultDecryptAeadRequest;
 import io.jsonwebtoken.impl.security.DefaultDecryptionKeyRequest;
+import io.jsonwebtoken.impl.security.DefaultKeySelection;
 import io.jsonwebtoken.impl.security.DefaultVerifySecureDigestRequest;
 import io.jsonwebtoken.impl.security.LocatingKeyResolver;
 import io.jsonwebtoken.impl.security.ProviderKey;
@@ -65,7 +66,10 @@ import io.jsonwebtoken.security.AeadAlgorithm;
 import io.jsonwebtoken.security.DecryptAeadRequest;
 import io.jsonwebtoken.security.DecryptionKeyRequest;
 import io.jsonwebtoken.security.InvalidKeyException;
+import io.jsonwebtoken.security.Jwk;
+import io.jsonwebtoken.security.JwkSetLocator;
 import io.jsonwebtoken.security.KeyAlgorithm;
+import io.jsonwebtoken.security.KeySelection;
 import io.jsonwebtoken.security.SecureDigestAlgorithm;
 import io.jsonwebtoken.security.SignatureException;
 import io.jsonwebtoken.security.VerifySecureDigestRequest;
@@ -266,8 +270,66 @@ public class DefaultJwtParser extends AbstractParser<Jwt<?, ?>> implements JwtPa
         return header != null && Strings.hasText(header.getContentType());
     }
 
-    private byte[] verifySignature(final TokenizedJwt tokenized, final JwsHeader jwsHeader, final String alg,
-                                   @SuppressWarnings("deprecation") SigningKeyResolver resolver, Claims claims, Payload payload) {
+    private static final class SignatureVerification {
+
+        private final byte[] signature;
+        private final KeySelection selection;
+
+        private SignatureVerification(byte[] signature, KeySelection selection) {
+            this.signature = signature;
+            this.selection = selection;
+        }
+    }
+
+    private KeySelection locateKeySelection(final JwsHeader jwsHeader, final SecureDigestAlgorithm<?, Key> algorithm,
+                                            @SuppressWarnings("deprecation") SigningKeyResolver resolver,
+                                            Claims claims, Payload payload) {
+
+        KeySelection selection;
+        if (this.signingKeyResolver == null && this.keyLocator instanceof JwkSetLocator) {
+            selection = ((JwkSetLocator) this.keyLocator).select(jwsHeader);
+        } else {
+            //digitally signed, let's assert the signature:
+            Key key;
+            if (claims != null) {
+                key = resolver.resolveSigningKey(jwsHeader, claims);
+            } else {
+                key = resolver.resolveSigningKey(jwsHeader, payload.getBytes());
+            }
+            if (key == null) {
+                String msg = "Cannot verify JWS signature: unable to locate signature verification key for JWS " +
+                        "with header: " + jwsHeader;
+                throw new UnsupportedJwtException(msg);
+            }
+            selection = new DefaultKeySelection(jwsHeader, algorithm.getId(), null, key, 0L);
+        }
+
+        if (selection == null || selection.getKey() == null) {
+            String msg = "Cannot verify JWS signature: unable to locate signature verification key for JWS " +
+                    "with header: " + jwsHeader;
+            throw new UnsupportedJwtException(msg);
+        }
+
+        Jwk<?> jwk = selection.getJwk();
+        String headerKid = Strings.clean(jwsHeader.getKeyId());
+        String jwkKid = jwk != null ? Strings.clean(jwk.getId()) : null;
+        if (Strings.hasText(headerKid) && Strings.hasText(jwkKid) && !headerKid.equals(jwkKid) &&
+                !headerKid.equalsIgnoreCase(jwkKid)) {
+            String msg = "The JWS header identifies key id '" + headerKid + "', but the selected JWK identifies " +
+                    "key id '" + jwkKid + "'. The token cannot be associated with a different key identity.";
+            throw new UnsupportedJwtException(msg);
+        }
+
+        // Bind the actual algorithm and key generation used by this parse operation to the evidence published
+        // on the Jws.
+        return new DefaultKeySelection(jwsHeader, algorithm.getId(), jwk, selection.getKey(),
+                selection.getGeneration());
+    }
+
+    private SignatureVerification verifySignature(final TokenizedJwt tokenized, final JwsHeader jwsHeader,
+                                                  final String alg,
+                                                  @SuppressWarnings("deprecation") SigningKeyResolver resolver,
+                                                  Claims claims, Payload payload) {
 
         Assert.notNull(resolver, "SigningKeyResolver instance cannot be null.");
 
@@ -275,29 +337,25 @@ public class DefaultJwtParser extends AbstractParser<Jwt<?, ?>> implements JwtPa
         try {
             algorithm = (SecureDigestAlgorithm<?, Key>) sigAlgs.apply(jwsHeader);
         } catch (UnsupportedJwtException e) {
-            //For backwards compatibility.  TODO: remove this try/catch block for 1.0 and let UnsupportedJwtException propagate
+            // For backwards compatibility. TODO: remove this try/catch block for 1.0 and let
+            // UnsupportedJwtException propagate
             String msg = "Unsupported signature algorithm '" + alg + "': " + e.getMessage();
             throw new SignatureException(msg, e);
         }
         Assert.stateNotNull(algorithm, "JWS Signature Algorithm cannot be null.");
 
-        //digitally signed, let's assert the signature:
-        Key key;
-        if (claims != null) {
-            key = resolver.resolveSigningKey(jwsHeader, claims);
-        } else {
-            key = resolver.resolveSigningKey(jwsHeader, payload.getBytes());
-        }
-        if (key == null) {
-            String msg = "Cannot verify JWS signature: unable to locate signature verification key for JWS with header: " + jwsHeader;
-            throw new UnsupportedJwtException(msg);
-        }
+        KeySelection selection = locateKeySelection(jwsHeader, algorithm, resolver, claims, payload);
+        Key key = selection.getKey();
         Provider provider = ProviderKey.getProvider(key, this.provider); // extract if necessary
         key = ProviderKey.getKey(key); // unwrap if necessary, MUST be called after ProviderKey.getProvider
         Assert.stateNotNull(key, "ProviderKey cannot be null."); //ProviderKey impl doesn't allow null
         if (key instanceof PrivateKey) {
             throw new InvalidKeyException(PRIV_KEY_VERIFY_MSG);
         }
+        // Preserve the fingerprint captured at selection time: ProviderKey unwrapping must not make the
+        // evidence attached to this token identify a different (or unavailable) key encoding.
+        selection = new DefaultKeySelection(jwsHeader, algorithm.getId(), selection.getJwk(), key,
+                selection.getFingerprint(), selection.getGeneration());
 
         final byte[] signature = decode(tokenized.getDigest(), "JWS signature");
 
@@ -356,7 +414,7 @@ public class DefaultJwtParser extends AbstractParser<Jwt<?, ?>> implements JwtPa
             Streams.reset(payloadStream);
         }
 
-        return signature;
+        return new SignatureVerification(signature, selection);
     }
 
     @Override
@@ -489,6 +547,7 @@ public class DefaultJwtParser extends AbstractParser<Jwt<?, ?>> implements JwtPa
 
         byte[] iv = null;
         byte[] digest = null; // either JWE AEAD tag or JWS signature after Base64Url-decoding
+        KeySelection keySelection = null; // JWS verification key identity, populated only after successful verification
         if (tokenized instanceof TokenizedJwe) {
 
             TokenizedJwe tokenizedJwe = (TokenizedJwe) tokenized;
@@ -574,7 +633,10 @@ public class DefaultJwtParser extends AbstractParser<Jwt<?, ?>> implements JwtPa
             // not using a signing key resolver, so we can verify the signature before reading the payload, which is
             // always safer:
             JwsHeader jwsHeader = Assert.stateIsInstance(JwsHeader.class, header, "Not a JwsHeader. ");
-            digest = verifySignature(tokenized, jwsHeader, alg, new LocatingKeyResolver(this.keyLocator), null, payload);
+            SignatureVerification verification =
+                    verifySignature(tokenized, jwsHeader, alg, new LocatingKeyResolver(this.keyLocator), null, payload);
+            digest = verification.signature;
+            keySelection = verification.selection;
             integrityVerified = true; // no exception means signature verified
         }
 
@@ -645,7 +707,10 @@ public class DefaultJwtParser extends AbstractParser<Jwt<?, ?>> implements JwtPa
             // A SigningKeyResolver has been configured, and due to it's API, we have to verify the signature after
             // parsing the body.  This can be a security risk, so it needs to be removed before 1.0
             JwsHeader jwsHeader = Assert.stateIsInstance(JwsHeader.class, header, "Not a JwsHeader. ");
-            digest = verifySignature(tokenized, jwsHeader, alg, this.signingKeyResolver, claims, payload);
+            SignatureVerification verification =
+                    verifySignature(tokenized, jwsHeader, alg, this.signingKeyResolver, claims, payload);
+            digest = verification.signature;
+            keySelection = verification.selection;
             //noinspection UnusedAssignment
             integrityVerified = true; // no exception means verified successfully
         }
@@ -656,7 +721,7 @@ public class DefaultJwtParser extends AbstractParser<Jwt<?, ?>> implements JwtPa
             jwt = new DefaultJwe<>((JweHeader) header, body, iv, digest);
         } else if (hasDigest) {
             JwsHeader jwsHeader = Assert.isInstanceOf(JwsHeader.class, header, "JwsHeader required.");
-            jwt = new DefaultJws<>(jwsHeader, body, digest, base64UrlDigest.toString());
+            jwt = new DefaultJws<>(jwsHeader, body, digest, base64UrlDigest.toString(), keySelection);
         } else {
             //noinspection rawtypes
             jwt = new DefaultJwt(header, body);

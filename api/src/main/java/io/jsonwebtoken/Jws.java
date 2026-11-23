@@ -15,6 +15,11 @@
  */
 package io.jsonwebtoken;
 
+import io.jsonwebtoken.security.Jwk;
+import io.jsonwebtoken.security.KeySelection;
+
+import java.security.Key;
+
 /**
  * An expanded (not compact/serialized) Signed JSON Web Token.
  *
@@ -54,6 +59,68 @@ public interface Jws<P> extends ProtectedJwt<JwsHeader, P> {
             return jws;
         }
     };
+
+    /**
+     * Returns the key selection used to verify this JWS, including the selected JWK (when available), algorithm,
+     * fingerprint and key generation.  The selection is captured by the same parse operation that produced this JWS,
+     * so it cannot change when a key locator is refreshed later.
+     *
+     * @return the key selection used to verify this JWS, or {@code null} if this JWS was not produced by parsing.
+     * @since 0.14.0
+     */
+    default KeySelection getKeySelection() {
+        return null;
+    }
+
+    /**
+     * Returns the key that verified this JWS, or {@code null} if this JWS was not produced by parsing.
+     *
+     * @return the key that verified this JWS, or {@code null} if this JWS was not produced by parsing.
+     * @since 0.14.0
+     */
+    default Key getKey() {
+        KeySelection selection = getKeySelection();
+        return selection != null ? selection.getKey() : null;
+    }
+
+    /**
+     * Returns the JWK selected to verify this JWS, or {@code null} when a raw key or explicit resolver supplied the
+     * verification key.
+     *
+     * @return the JWK selected to verify this JWS, or {@code null} when a raw key or explicit resolver supplied the
+     * verification key.
+     * @since 0.14.0
+     */
+    default Jwk<?> getJwk() {
+        KeySelection selection = getKeySelection();
+        return selection != null ? selection.getJwk() : null;
+    }
+
+    /**
+     * Returns the fingerprint of the key that verified this JWS, or {@code null} if this JWS was not produced by
+     * parsing.
+     *
+     * @return the fingerprint of the key that verified this JWS, or {@code null} if this JWS was not produced by
+     * parsing.
+     * @since 0.14.0
+     */
+    default String getKeyFingerprint() {
+        KeySelection selection = getKeySelection();
+        return selection != null ? selection.getFingerprint() : null;
+    }
+
+    /**
+     * Returns the key generation that verified this JWS, or {@code 0} when a raw key or explicit resolver supplied the
+     * verification key.
+     *
+     * @return the key generation that verified this JWS, or {@code 0} when a raw key or explicit resolver supplied the
+     * verification key.
+     * @since 0.14.0
+     */
+    default long getKeyGeneration() {
+        KeySelection selection = getKeySelection();
+        return selection != null ? selection.getGeneration() : 0L;
+    }
 
     /**
      * Returns the verified JWS signature as a Base64Url string.

@@ -18,6 +18,7 @@ package io.jsonwebtoken.impl;
 import io.jsonwebtoken.Jws;
 import io.jsonwebtoken.JwsHeader;
 import io.jsonwebtoken.JwtVisitor;
+import io.jsonwebtoken.security.KeySelection;
 
 public class DefaultJws<P> extends DefaultProtectedJwt<JwsHeader, P> implements Jws<P> {
 
@@ -25,9 +26,21 @@ public class DefaultJws<P> extends DefaultProtectedJwt<JwsHeader, P> implements 
 
     private final String signature;
 
+    private final KeySelection keySelection;
+
     public DefaultJws(JwsHeader header, P payload, byte[] signature, String b64UrlSig) {
+        this(header, payload, signature, b64UrlSig, null);
+    }
+
+    public DefaultJws(JwsHeader header, P payload, byte[] signature, String b64UrlSig, KeySelection keySelection) {
         super(header, payload, signature, DIGEST_NAME);
         this.signature = b64UrlSig;
+        this.keySelection = keySelection;
+    }
+
+    @Override
+    public KeySelection getKeySelection() {
+        return this.keySelection;
     }
 
     @Override

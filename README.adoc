@@ -3182,6 +3182,32 @@ As shown above, you can specify a custom JCA Provider, <<json,JSON deserializer>
 same way as the `JwkSetBuilder`. Any JWK that does not match the default (or configured) policy will be
 rejected. You can create a policy to override the default if desired using the `Jwks.OP.policy()` builder method.
 
+++<a name="jwkset-locator">++++++</a>+++
+
+=== Use a JWK Set for JWS Verification
+
+`Jwks.locator(jwkSet)` creates a `JwkSetLocator` that can be configured on a `JwtParserBuilder`. The locator selects
+keys by the JWS `kid` header and can be refreshed atomically when a JWK Set is rotated:
+
+[,java]
+----
+JwkSetLocator locator = Jwks.locator(initialJwkSet);
+JwtParser parser = Jwts.parser().keyLocator(locator).build();
+
+Jws<Claims> first = parser.parseSignedClaims(firstToken);
+String firstFingerprint = first.getKeyFingerprint();
+long firstGeneration = first.getKeyGeneration();
+
+locator.refresh(rotatedJwkSet);
+
+Jws<Claims> second = parser.parseSignedClaims(secondToken);
+----
+
+Every returned `Jws` retains the JWK, algorithm, fingerprint and JWK Set generation that verified that specific token.
+Refreshing the locator cannot replace those values on an already parsed JWS. A JWK Set with exactly one usable
+verification key can verify tokens without a `kid` header; multiple candidate keys without a `kid` are rejected as
+ambiguous.
+
 +++<a name="compression">++++++</a>+++
 
 == Compression

@@ -34,6 +34,10 @@ public class DefaultMutableJweHeader extends DefaultJweHeaderMutator<DefaultMuta
         return this.DELEGATE.get(param);
     }
 
+    private static byte[] copy(byte[] value) {
+        return value != null ? value.clone() : null;
+    }
+
     // =============================================================
     // JWT Header methods
     // =============================================================
@@ -112,12 +116,12 @@ public class DefaultMutableJweHeader extends DefaultJweHeaderMutator<DefaultMuta
 
     @Override
     public byte[] getAgreementPartyUInfo() {
-        return get(DefaultJweHeader.APU);
+        return copy(get(DefaultJweHeader.APU));
     }
 
     @Override
     public byte[] getAgreementPartyVInfo() {
-        return get(DefaultJweHeader.APV);
+        return copy(get(DefaultJweHeader.APV));
     }
 
     @Override
@@ -137,16 +141,16 @@ public class DefaultMutableJweHeader extends DefaultJweHeaderMutator<DefaultMuta
 
     @Override
     public byte[] getInitializationVector() {
-        return get(DefaultJweHeader.IV);
+        return copy(get(DefaultJweHeader.IV));
     }
 
     @Override
     public byte[] getAuthenticationTag() {
-        return get(DefaultJweHeader.TAG);
+        return copy(get(DefaultJweHeader.TAG));
     }
 
     @Override
     public byte[] getPbes2Salt() {
-        return get(DefaultJweHeader.P2S);
+        return copy(get(DefaultJweHeader.P2S));
     }
 }

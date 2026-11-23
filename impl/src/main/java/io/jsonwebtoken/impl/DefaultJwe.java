@@ -31,8 +31,19 @@ public class DefaultJwe<P> extends DefaultProtectedJwt<JweHeader, P> implements 
     private final byte[] iv;
 
     public DefaultJwe(JweHeader header, P payload, byte[] iv, byte[] aadTag) {
-        super(header, payload, aadTag, DIGEST_NAME);
-        this.iv = Assert.notEmpty(iv, "Initialization vector cannot be null or empty.");
+        super(snapshot(header), payload, copy(aadTag, "Digest byte array cannot be null or empty."), DIGEST_NAME);
+        this.iv = copy(iv, "Initialization vector cannot be null or empty.");
+    }
+
+    private static JweHeader snapshot(JweHeader header) {
+        Assert.notNull(header, "header cannot be null.");
+        // DefaultJweHeader is immutable.  Other JweHeader implementations may be backed by mutable builders, so
+        // retain an immutable copy to prevent a later mutation from changing an already-returned JWE.
+        return header instanceof DefaultJweHeader ? header : new DefaultJweHeader(header);
+    }
+
+    private static byte[] copy(byte[] value, String message) {
+        return Assert.notEmpty(value, message).clone();
     }
 
     @Override

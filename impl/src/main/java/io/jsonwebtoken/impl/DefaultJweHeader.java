@@ -27,7 +27,12 @@ import io.jsonwebtoken.lang.Registry;
 import io.jsonwebtoken.lang.Strings;
 import io.jsonwebtoken.security.PublicJwk;
 
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * Header implementation satisfying JWE header parameter requirements.
@@ -76,8 +81,45 @@ public class DefaultJweHeader extends DefaultProtectedHeader implements JweHeade
 
     }
 
+    /**
+     * Creates an immutable JWE header from the specified values.
+     *
+     * <p>The values are copied before they are converted to their idiomatic Java values.  In particular, mutable
+     * values such as {@code byte[]} arrays are copied so a caller cannot change a header after it has been used to
+     * select a key or decrypt a JWE.  A parsed header and all of its readers therefore always describe the same
+     * header generation.</p>
+     *
+     * @param map the header values
+     */
     public DefaultJweHeader(Map<String, ?> map) {
-        super(PARAMS, map);
+        super(PARAMS, copy(map));
+    }
+
+    private static Map<String, ?> copy(Map<String, ?> map) {
+        if (map == null) {
+            return null;
+        }
+        Map<String, Object> copy = new LinkedHashMap<>(map.size());
+        for (Map.Entry<String, ?> entry : map.entrySet()) {
+            Object value = entry.getValue();
+            if (value instanceof byte[]) {
+                value = ((byte[]) value).clone();
+            } else if (value instanceof Set) {
+                value = new LinkedHashSet<>((Set<?>) value);
+            } else if (value instanceof Collection) {
+                value = new ArrayList<>((Collection<?>) value);
+            } else if (value instanceof Map) {
+                value = new LinkedHashMap<>((Map<?, ?>) value);
+            } else if (value instanceof Object[]) {
+                value = ((Object[]) value).clone();
+            }
+            copy.put(entry.getKey(), value);
+        }
+        return copy;
+    }
+
+    private static byte[] copy(byte[] value) {
+        return value != null ? value.clone() : null;
     }
 
     @Override
@@ -97,26 +139,26 @@ public class DefaultJweHeader extends DefaultProtectedHeader implements JweHeade
 
     @Override
     public byte[] getAgreementPartyUInfo() {
-        return get(APU);
+        return copy(get(APU));
     }
 
     @Override
     public byte[] getAgreementPartyVInfo() {
-        return get(APV);
+        return copy(get(APV));
     }
 
     @Override
     public byte[] getInitializationVector() {
-        return get(IV);
+        return copy(get(IV));
     }
 
     @Override
     public byte[] getAuthenticationTag() {
-        return get(TAG);
+        return copy(get(TAG));
     }
 
     public byte[] getPbes2Salt() {
-        return get(P2S);
+        return copy(get(P2S));
     }
 
     @Override

@@ -676,9 +676,15 @@ public class DefaultJwtBuilder implements JwtBuilder {
 
         InputStream plaintext = toInputStream("JWE Payload", content);
 
+        // Freeze the user-provided header for this compact operation.  Key algorithms may add generated
+        // parameters such as an ECDH 'epk' or PBES2 'p2s'/'p2c'.  Keeping those additions in a detached snapshot
+        // means a failed attempt cannot leave stale key-management state in the builder, and a retry with a
+        // different key can never emit the previous attempt's ephemeral public key.
+        final DefaultJwtHeaderBuilder headerBuilder = this.headerBuilder.snapshot();
+
         //only expose (mutable) JweHeader functionality to KeyAlgorithm instances, not the full headerBuilder
         // (which exposes this JwtBuilder and shouldn't be referenced by KeyAlgorithms):
-        JweHeader delegate = new DefaultMutableJweHeader(this.headerBuilder);
+        JweHeader delegate = new DefaultMutableJweHeader(headerBuilder);
         KeyRequest<Key> keyRequest = new DefaultKeyRequest<>(key, keyProvider, this.secureRandom, delegate, enc);
         KeyResult keyResult = keyAlgFunction.apply(keyRequest);
         Assert.stateNotNull(keyResult, "KeyAlgorithm must return a KeyResult.");
@@ -687,10 +693,10 @@ public class DefaultJwtBuilder implements JwtBuilder {
         byte[] encryptedCek = Assert.notNull(keyResult.getPayload(),
                 "KeyResult must return an encrypted key byte array, even if empty.");
 
-        this.headerBuilder.add(DefaultHeader.ALGORITHM.getId(), keyAlg.getId());
-        this.headerBuilder.put(DefaultJweHeader.ENCRYPTION_ALGORITHM.getId(), enc.getId());
+        headerBuilder.add(DefaultHeader.ALGORITHM.getId(), keyAlg.getId());
+        headerBuilder.put(DefaultJweHeader.ENCRYPTION_ALGORITHM.getId(), enc.getId());
 
-        final JweHeader header = Assert.isInstanceOf(JweHeader.class, this.headerBuilder.build(),
+        final JweHeader header = Assert.isInstanceOf(JweHeader.class, headerBuilder.build(),
                 "Invalid header created: ");
 
         // ----- header -----

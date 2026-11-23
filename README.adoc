@@ -1299,6 +1299,11 @@ for any information that can help you look up the `Key` to use for verifying _th
 powerful for applications with more complex security models that might use different keys at different times or for
 different users or customers.
 
+For each parse, JJWT captures the compact JWE, its protected header and the key returned by the locator before
+decrypting.  The same header, key, AEAD/zip output and resulting claims are used to construct the returned JWE.  A
+later retry or key rotation creates a new parse transaction; it cannot change the header or claims of an already
+parsed JWE, or cause a failed attempt's header to be attributed to the next one.
+
 +++<a name="key-locator-strategy">++++++</a>+++
 
 ==== Key Locator Strategy

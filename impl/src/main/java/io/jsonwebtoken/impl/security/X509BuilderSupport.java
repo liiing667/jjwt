@@ -105,6 +105,18 @@ public class X509BuilderSupport implements X509Builder<X509BuilderSupport> {
         }
     }
 
+    /**
+     * Copies the deferred X.509 computation state from another builder.  The header values themselves are copied by
+     * the caller; this method only ensures a per-issuance header snapshot also retains the original X.509 policy.
+     *
+     * @param src the source builder state
+     */
+    public void copyFrom(X509BuilderSupport src) {
+        Assert.notNull(src, "X509BuilderSupport cannot be null.");
+        this.computeX509Sha1Thumbprint = src.computeX509Sha1Thumbprint;
+        this.computeX509Sha256Thumbprint = src.computeX509Sha256Thumbprint;
+    }
+
     public void apply() {
         List<X509Certificate> chain = this.map.get(AbstractAsymmetricJwk.X5C);
         X509Certificate firstCert = null;

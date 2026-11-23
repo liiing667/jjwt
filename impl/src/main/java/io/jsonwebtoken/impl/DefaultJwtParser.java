@@ -86,6 +86,7 @@ import java.security.Provider;
 import java.security.PublicKey;
 import java.util.Collection;
 import java.util.Date;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.Map;
 import java.util.Set;
@@ -211,6 +212,103 @@ public class DefaultJwtParser extends AbstractParser<Jwt<?, ?>> implements JwtPa
     private final Set<String> critical;
 
     private final long allowedClockSkewMillis;
+
+    /**
+     * Immutable identity of one JWE decryption attempt.
+     *
+     * <p>The complete compact token, its protected header and the algorithms/keys selected from that header are
+     * captured together before decryption.  The resulting {@link DefaultJwe} is only created after the snapshot is
+     * checked again, so a mutable custom header or a later retry cannot mix one JWE's header, key, plaintext or
+     * claims with another JWE.</p>
+     */
+    private static final class JweDecryptionContext {
+
+        private final String protectedHeader;
+        private final String encryptedKey;
+        private final String initializationVector;
+        private final String ciphertext;
+        private final String authenticationTag;
+        private final TokenizedJwe tokenized;
+        private final JweHeader header;
+        private final Map<String, Object> headerSnapshot;
+        private final KeyAlgorithm<?, ?> keyAlgorithm;
+        private final AeadAlgorithm encryptionAlgorithm;
+
+        private Key key;
+        private SecretKey cek;
+        private byte[] iv;
+        private byte[] tag;
+        private Payload plaintext;
+        private Claims claims;
+
+        private JweDecryptionContext(TokenizedJwe tokenized, JweHeader header,
+                                     KeyAlgorithm<?, ?> keyAlgorithm, AeadAlgorithm encryptionAlgorithm) {
+            this.tokenized = Assert.notNull(tokenized, "Tokenized JWE cannot be null.");
+            this.protectedHeader = tokenized.getProtected().toString();
+            this.encryptedKey = tokenized.getEncryptedKey().toString();
+            this.initializationVector = tokenized.getIv().toString();
+            this.ciphertext = tokenized.getPayload().toString();
+            this.authenticationTag = tokenized.getDigest().toString();
+            this.header = Assert.notNull(header, "JWE header cannot be null.");
+            this.headerSnapshot = new LinkedHashMap<>(header);
+            this.keyAlgorithm = Assert.notNull(keyAlgorithm, "JWE KeyAlgorithm cannot be null.");
+            this.encryptionAlgorithm = Assert.notNull(encryptionAlgorithm, "JWE AeadAlgorithm cannot be null.");
+        }
+
+        private void setKey(Key key) {
+            this.key = Assert.notNull(key, "JWE decryption key cannot be null.");
+        }
+
+        private void setCek(SecretKey cek) {
+            this.cek = Assert.notNull(cek, "JWE content encryption key cannot be null.");
+        }
+
+        private void setIv(byte[] iv) {
+            this.iv = Assert.notEmpty(iv, "JWE Initialization Vector cannot be null or empty.").clone();
+        }
+
+        private void setTag(byte[] tag) {
+            this.tag = Assert.notEmpty(tag, "JWE AAD Authentication Tag cannot be null or empty.").clone();
+        }
+
+        private void setPlaintext(Payload plaintext) {
+            this.plaintext = Assert.notNull(plaintext, "JWE plaintext cannot be null.");
+        }
+
+        private void setClaims(Claims claims) {
+            this.claims = claims;
+        }
+
+        private void assertSameToken() {
+            Assert.state(protectedHeader.equals(this.tokenized.getProtected().toString()) &&
+                            encryptedKey.equals(this.tokenized.getEncryptedKey().toString()) &&
+                            initializationVector.equals(this.tokenized.getIv().toString()) &&
+                            ciphertext.equals(this.tokenized.getPayload().toString()) &&
+                            authenticationTag.equals(this.tokenized.getDigest().toString()),
+                    "internal error: JWE compact token changed during decryption.");
+            Assert.state(headerSnapshot.equals(new LinkedHashMap<>(this.header)),
+                    "JWE header changed during decryption. Refusing to associate the decrypted claims with a " +
+                            "different header: " + this.header);
+            Assert.state(Objects.nullSafeEquals(this.header.getAlgorithm(), this.keyAlgorithm.getId()),
+                    "JWE key algorithm changed during decryption. Refusing to associate the decrypted claims " +
+                            "with a different header: " + this.header);
+            Assert.state(Objects.nullSafeEquals(this.header.getEncryptionAlgorithm(), this.encryptionAlgorithm.getId()),
+                    "JWE encryption algorithm changed during decryption. Refusing to associate the decrypted " +
+                            "claims with a different header: " + this.header);
+            Assert.stateNotNull(this.key, "JWE decryption key was not captured.");
+            Assert.stateNotNull(this.cek, "JWE content encryption key was not captured.");
+            Assert.stateNotNull(this.iv, "JWE Initialization Vector was not captured.");
+            Assert.stateNotNull(this.tag, "JWE AAD Authentication Tag was not captured.");
+            Assert.stateNotNull(this.plaintext, "JWE plaintext was not captured.");
+        }
+
+        private DefaultJwe<Object> toJwe(Object body) {
+            assertSameToken();
+            Assert.state(this.claims == null || this.claims == body,
+                    "internal error: JWE claims changed after decryption.");
+            return new DefaultJwe<>(this.header, body, this.iv, this.tag);
+        }
+    }
 
     //SigningKeyResolver will be removed for 1.0:
     @SuppressWarnings("deprecation")
@@ -489,6 +587,7 @@ public class DefaultJwtParser extends AbstractParser<Jwt<?, ?>> implements JwtPa
 
         byte[] iv = null;
         byte[] digest = null; // either JWE AEAD tag or JWS signature after Base64Url-decoding
+        JweDecryptionContext jweContext = null;
         if (tokenized instanceof TokenizedJwe) {
 
             TokenizedJwe tokenizedJwe = (TokenizedJwe) tokenized;
@@ -500,6 +599,10 @@ public class DefaultJwtParser extends AbstractParser<Jwt<?, ?>> implements JwtPa
             Assert.stateNotNull(encAlg, "JWE Encryption Algorithm cannot be null.");
             @SuppressWarnings("rawtypes") final KeyAlgorithm keyAlg = this.keyAlgs.apply(jweHeader);
             Assert.stateNotNull(keyAlg, "JWE Key Algorithm cannot be null.");
+
+            // Capture the compact token, protected header, and selected algorithm instances before any key lookup or
+            // decryption work.  Everything used to produce the returned Jwe must come from this one snapshot.
+            jweContext = new JweDecryptionContext(tokenizedJwe, jweHeader, keyAlg, encAlg);
 
             byte[] cekBytes = Bytes.EMPTY; //ignored unless using an encrypted key algorithm
             CharSequence base64Url = tokenizedJwe.getEncryptedKey();
@@ -519,6 +622,7 @@ public class DefaultJwtParser extends AbstractParser<Jwt<?, ?>> implements JwtPa
                 String msg = "Compact JWE strings must always contain an Initialization Vector.";
                 throw new MalformedJwtException(msg);
             }
+            jweContext.setIv(iv);
 
             // The AAD (Additional Authenticated Data) scheme for compact JWEs is to use the ASCII bytes of the
             // raw base64url text as the AAD, and NOT the base64url-decoded bytes per
@@ -536,6 +640,7 @@ public class DefaultJwtParser extends AbstractParser<Jwt<?, ?>> implements JwtPa
                 String msg = "Compact JWE strings must always contain an AAD Authentication Tag.";
                 throw new MalformedJwtException(msg);
             }
+            jweContext.setTag(digest);
 
             Key key = this.keyLocator.locate(jweHeader);
             if (key == null) {
@@ -549,6 +654,7 @@ public class DefaultJwtParser extends AbstractParser<Jwt<?, ?>> implements JwtPa
             // extract key-specific provider if necessary;
             Provider provider = ProviderKey.getProvider(key, this.provider);
             key = ProviderKey.getKey(key); // this must be called after ProviderKey.getProvider
+            jweContext.setKey(key);
             DecryptionKeyRequest<Key> request =
                     new DefaultDecryptionKeyRequest<>(cekBytes, provider, null, jweHeader, encAlg, key);
             final SecretKey cek = keyAlg.getDecryptionKey(request);
@@ -557,6 +663,7 @@ public class DefaultJwtParser extends AbstractParser<Jwt<?, ?>> implements JwtPa
                         "Unable to perform '" + encAlg.getId() + "' decryption.";
                 throw new IllegalStateException(msg);
             }
+            jweContext.setCek(cek);
 
             // During decryption, the available Provider applies to the KeyAlgorithm, not the AeadAlgorithm, mostly
             // because all JVMs support the standard AeadAlgorithms (especially with BouncyCastle in the classpath).
@@ -567,6 +674,7 @@ public class DefaultJwtParser extends AbstractParser<Jwt<?, ?>> implements JwtPa
             DecryptAeadRequest dreq = new DefaultDecryptAeadRequest(ciphertext, cek, aad, iv, digest);
             encAlg.decrypt(dreq, plaintext);
             payload = new Payload(plaintext.toByteArray(), header.getContentType());
+            jweContext.setPlaintext(payload);
 
             integrityVerified = true; // AEAD performs integrity verification, so no exception = verified
 
@@ -653,7 +761,10 @@ public class DefaultJwtParser extends AbstractParser<Jwt<?, ?>> implements JwtPa
         Jwt<?, ?> jwt;
         Object body = claims != null ? claims : payloadBytes;
         if (header instanceof JweHeader) {
-            jwt = new DefaultJwe<>((JweHeader) header, body, iv, digest);
+            Assert.stateNotNull(jweContext, "internal error: JWE decryption context is missing.");
+            jweContext.setPlaintext(payload); // ensure the decompressed plaintext is the one committed below
+            jweContext.setClaims(claims);
+            jwt = jweContext.toJwe(body);
         } else if (hasDigest) {
             JwsHeader jwsHeader = Assert.isInstanceOf(JwsHeader.class, header, "JwsHeader required.");
             jwt = new DefaultJws<>(jwsHeader, body, digest, base64UrlDigest.toString());

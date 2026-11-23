@@ -50,6 +50,23 @@ public class DefaultJweHeaderMutator<T extends JweHeaderMutator<T>>
         this.x509 = src.x509;
     }
 
+    /**
+     * Returns a detached copy of this header's current values.
+     *
+     * <p>The copy is used for a single compact operation so generated JWE parameters (for example {@code alg},
+     * {@code enc}, and an ECDH {@code epk}) cannot be retained by the template builder after success or failure.
+     * A retry with a different key therefore starts from the same user-provided header values and cannot carry
+     * over an ephemeral public key from an earlier attempt.</p>
+     *
+     * @return a detached header builder copy
+     */
+    DefaultJwtHeaderBuilder snapshot() {
+        DefaultJwtHeaderBuilder copy = new DefaultJwtHeaderBuilder();
+        copy.putAll(this.DELEGATE);
+        copy.x509.copyFrom(this.x509);
+        return copy;
+    }
+
     // =============================================================
     // MapMutator methods
     // =============================================================

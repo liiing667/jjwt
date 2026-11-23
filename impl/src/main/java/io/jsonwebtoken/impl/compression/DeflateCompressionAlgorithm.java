@@ -15,6 +15,8 @@
  */
 package io.jsonwebtoken.impl.compression;
 
+import io.jsonwebtoken.impl.io.LimitedByteArrayOutputStream;
+import io.jsonwebtoken.impl.io.Streams;
 import io.jsonwebtoken.lang.Objects;
 
 import java.io.ByteArrayOutputStream;
@@ -76,7 +78,8 @@ public class DeflateCompressionAlgorithm extends AbstractCompressionAlgorithm {
         ByteArrayOutputStream decompressedOutputStream = null;
 
         try {
-            decompressedOutputStream = new ByteArrayOutputStream();
+            decompressedOutputStream = new LimitedByteArrayOutputStream(512,
+                    Streams.MAX_DECOMPRESSED_PAYLOAD_SIZE, getId());
             inflaterOutputStream = new InflaterOutputStream(decompressedOutputStream);
             inflaterOutputStream.write(compressed);
             inflaterOutputStream.flush();

@@ -4,6 +4,11 @@
 
 The first JJWT release that uses Java 8+ features.  This release is not strictly backwards compatible and will also not work with Java 7.
 
+- JWT payload decompression is now bounded to protect against decompression ("zip") bombs: a token whose compressed
+  payload expands beyond 250 KB is rejected with a `CompressionException` from both the JWS and JWE parsing paths, and
+  no partially-parsed JWT is produced.  The decompressed payload is materialized once and the same payload identity is
+  shared by integrity verification, claims deserialization, and raw content consumers.
+
 #### Backwards Compatibility Breaking Changes
 
 - The `io.jsonwebtoken.lang.Supplier` interface has been renamed and moved to `io.jsonwebtoken.security.ConfidentialValue` to avoid any potential risk of conflict or accidental use

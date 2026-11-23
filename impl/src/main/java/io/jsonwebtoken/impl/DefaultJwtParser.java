@@ -452,6 +452,9 @@ public class DefaultJwtParser extends AbstractParser<Jwt<?, ?>> implements JwtPa
         }
 
         // =============== Payload =================
+        // Freeze the compression declaration and payload identity before consuming or verifying the payload.  JWS and
+        // JWE paths below use this same algorithm and the same Payload instance for decompression and consumption:
+        final CompressionAlgorithm compressionAlgorithm = zipAlgs.apply(header);
         final CharSequence payloadToken = tokenized.getPayload();
         Payload payload;
         boolean integrityVerified = false; // only true after successful signature verification or AEAD decryption
@@ -566,7 +569,7 @@ public class DefaultJwtParser extends AbstractParser<Jwt<?, ?>> implements JwtPa
             ByteArrayOutputStream plaintext = new ByteArrayOutputStream(8192);
             DecryptAeadRequest dreq = new DefaultDecryptAeadRequest(ciphertext, cek, aad, iv, digest);
             encAlg.decrypt(dreq, plaintext);
-            payload = new Payload(plaintext.toByteArray(), header.getContentType());
+            payload = payload.replaceContent(plaintext.toByteArray());
 
             integrityVerified = true; // AEAD performs integrity verification, so no exception = verified
 
@@ -578,7 +581,6 @@ public class DefaultJwtParser extends AbstractParser<Jwt<?, ?>> implements JwtPa
             integrityVerified = true; // no exception means signature verified
         }
 
-        final CompressionAlgorithm compressionAlgorithm = zipAlgs.apply(header);
         if (compressionAlgorithm != null) {
             if (!integrityVerified) {
                 if (!payloadBase64UrlEncoded) {

@@ -15,6 +15,7 @@
  */
 package io.jsonwebtoken.impl.io;
 
+import io.jsonwebtoken.CompressionException;
 import io.jsonwebtoken.impl.lang.Bytes;
 import io.jsonwebtoken.lang.Assert;
 import io.jsonwebtoken.lang.Objects;
@@ -39,6 +40,41 @@ public class Streams {
      * Represents the end-of-file (or stream).
      */
     public static final int EOF = -1;
+
+    /**
+     * Maximum number of bytes a JWT payload may expand to during decompression.  JWT payloads are normally quite
+     * small; this upper bound prevents a tiny compressed token from exhausting parser memory or CPU.
+     *
+     * @since 0.14.0
+     */
+    public static final long MAX_DECOMPRESSED_PAYLOAD_SIZE = 250_000L; // 250 KB
+
+    /**
+     * Returns a stream that reads at most {@link #MAX_DECOMPRESSED_PAYLOAD_SIZE} decompressed bytes.
+     *
+     * @param in          the decompressed stream to wrap
+     * @param algorithmId the compression algorithm identifier, used in failure messages
+     * @return a stream with a fixed, cumulative read budget
+     * @since 0.14.0
+     */
+    public static InputStream limit(InputStream in, String algorithmId) {
+        return new LimitedInputStream(in, MAX_DECOMPRESSED_PAYLOAD_SIZE, algorithmId);
+    }
+
+    /**
+     * Creates the exception used when a decompression budget is exhausted.
+     *
+     * @param algorithmId the compression algorithm identifier
+     * @param limit       the configured byte limit
+     * @return the exception describing the rejected decompression
+     * @since 0.14.0
+     */
+    public static CompressionException decompressionLimitExceeded(String algorithmId, long limit) {
+        String id = algorithmId != null ? algorithmId : "unknown";
+        String msg = "Decompression failed for algorithm '" + id + "': decompressed payload exceeds the maximum " +
+                "allowed size of " + limit + " bytes.";
+        return new CompressionException(msg);
+    }
 
     public static byte[] bytes(final InputStream in, String exmsg) {
         if (in instanceof BytesInputStream) {

@@ -76,7 +76,12 @@ public abstract class AbstractCompressionAlgorithm implements CompressionAlgorit
         this.IS_WRAP_FN = forDecompression(new CheckedFunction<InputStream, InputStream>() {
             @Override
             public InputStream apply(InputStream is) throws Exception {
-                return doDecompress(is);
+                InputStream decompressed = doDecompress(is);
+                if (decompressed == null) {
+                    String msg = "Decompression failed for algorithm '" + getId() + "': null decompressed stream.";
+                    throw new CompressionException(msg);
+                }
+                return Streams.limit(decompressed, getId());
             }
         });
         this.DECOMPRESS_FN = forDecompression(new CheckedFunction<byte[], byte[]>() {
@@ -140,7 +145,11 @@ public abstract class AbstractCompressionAlgorithm implements CompressionAlgorit
     @Override
     public final byte[] decompress(byte[] compressed) {
         if (Bytes.isEmpty(compressed)) return Bytes.EMPTY;
-        return this.DECOMPRESS_FN.apply(compressed);
+        byte[] decompressed = this.DECOMPRESS_FN.apply(compressed);
+        if ((long) Bytes.length(decompressed) > Streams.MAX_DECOMPRESSED_PAYLOAD_SIZE) {
+            throw Streams.decompressionLimitExceeded(getId(), Streams.MAX_DECOMPRESSED_PAYLOAD_SIZE);
+        }
+        return decompressed;
     }
 
     /**

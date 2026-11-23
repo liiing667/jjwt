@@ -18,6 +18,7 @@ package io.jsonwebtoken.impl;
 import io.jsonwebtoken.Jws;
 import io.jsonwebtoken.JwsHeader;
 import io.jsonwebtoken.JwtVisitor;
+import io.jsonwebtoken.lang.Assert;
 
 public class DefaultJws<P> extends DefaultProtectedJwt<JwsHeader, P> implements Jws<P> {
 
@@ -26,8 +27,19 @@ public class DefaultJws<P> extends DefaultProtectedJwt<JwsHeader, P> implements 
     private final String signature;
 
     public DefaultJws(JwsHeader header, P payload, byte[] signature, String b64UrlSig) {
-        super(header, payload, signature, DIGEST_NAME);
-        this.signature = b64UrlSig;
+        super(snapshot(header), payload, copy(signature), DIGEST_NAME);
+        this.signature = Assert.hasText(b64UrlSig, "JWS signature cannot be null or empty.");
+    }
+
+    private static JwsHeader snapshot(JwsHeader header) {
+        Assert.notNull(header, "header cannot be null.");
+        // DefaultJwsHeader is immutable.  Other JwsHeader implementations may be backed by mutable builders, so
+        // retain an immutable copy to prevent a later mutation from changing an already-returned JWS.
+        return header instanceof DefaultJwsHeader ? header : new DefaultJwsHeader(header);
+    }
+
+    private static byte[] copy(byte[] signature) {
+        return Assert.notEmpty(signature, "Signature byte array cannot be null or empty.").clone();
     }
 
     @Override

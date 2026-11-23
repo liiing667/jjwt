@@ -86,6 +86,7 @@ import java.security.Provider;
 import java.security.PublicKey;
 import java.util.Collection;
 import java.util.Date;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.Map;
 import java.util.Set;
@@ -212,6 +213,71 @@ public class DefaultJwtParser extends AbstractParser<Jwt<?, ?>> implements JwtPa
 
     private final long allowedClockSkewMillis;
 
+    /**
+     * Immutable identity of one JWS signature verification attempt.
+     *
+     * <p>The complete compact token, its protected header, the {@code alg} header value and the
+     * {@link SecureDigestAlgorithm} resolved from it are captured together before any key is located or any
+     * signature is verified.  The located key and the verified signature are added to the same transaction, and
+     * the resulting {@link DefaultJws} is only created after the snapshot is checked again.  This ensures the
+     * header algorithm, the located key, the verification operation and the returned {@code Jws} identity all
+     * belong to a single policy transaction: an algorithm/key mismatch, a mutable custom header, or a stateful
+     * algorithm registry or key locator cannot cause the parser to verify with one algorithm and then mark the
+     * token as successfully verified with another.</p>
+     */
+    private static final class JwsVerificationContext {
+
+        private final String protectedHeader;
+        private final String payload;
+        private final String digest;
+        private final TokenizedJwt tokenized;
+        private final JwsHeader header;
+        private final Map<String, Object> headerSnapshot;
+        private final SecureDigestAlgorithm<?, Key> algorithm;
+
+        private Key key;
+        private byte[] signature;
+
+        private JwsVerificationContext(TokenizedJwt tokenized, JwsHeader header,
+                                       SecureDigestAlgorithm<?, Key> algorithm) {
+            this.tokenized = Assert.notNull(tokenized, "TokenizedJwt cannot be null.");
+            this.protectedHeader = tokenized.getProtected().toString();
+            this.payload = tokenized.getPayload().toString();
+            this.digest = tokenized.getDigest().toString();
+            this.header = Assert.notNull(header, "JwsHeader cannot be null.");
+            this.headerSnapshot = new LinkedHashMap<>(header);
+            this.algorithm = Assert.notNull(algorithm, "JWS SecureDigestAlgorithm cannot be null.");
+        }
+
+        private void setKey(Key key) {
+            this.key = Assert.notNull(key, "JWS signature verification key cannot be null.");
+        }
+
+        private void setSignature(byte[] signature) {
+            this.signature = Assert.notEmpty(signature, "JWS signature byte array cannot be null or empty.").clone();
+        }
+
+        private void assertSameToken() {
+            Assert.state(protectedHeader.equals(this.tokenized.getProtected().toString()) &&
+                            payload.equals(this.tokenized.getPayload().toString()) &&
+                            digest.equals(this.tokenized.getDigest().toString()),
+                    "internal error: JWS compact token changed during signature verification.");
+            Assert.state(headerSnapshot.equals(new LinkedHashMap<>(this.header)),
+                    "JWS header changed during signature verification. Refusing to associate the verified " +
+                            "signature with a different header: " + this.header);
+            Assert.state(Objects.nullSafeEquals(this.header.getAlgorithm(), this.algorithm.getId()),
+                    "JWS 'alg' header value changed during signature verification. Refusing to associate the " +
+                            "verified signature with a different header: " + this.header);
+            Assert.stateNotNull(this.key, "JWS signature verification key was not captured.");
+            Assert.stateNotNull(this.signature, "JWS verified signature was not captured.");
+        }
+
+        private DefaultJws<Object> toJws(Object body) {
+            assertSameToken();
+            return new DefaultJws<>(this.header, body, this.signature, this.digest);
+        }
+    }
+
     //SigningKeyResolver will be removed for 1.0:
     @SuppressWarnings("deprecation")
     DefaultJwtParser(Provider provider,
@@ -266,11 +332,14 @@ public class DefaultJwtParser extends AbstractParser<Jwt<?, ?>> implements JwtPa
         return header != null && Strings.hasText(header.getContentType());
     }
 
-    private byte[] verifySignature(final TokenizedJwt tokenized, final JwsHeader jwsHeader, final String alg,
-                                   @SuppressWarnings("deprecation") SigningKeyResolver resolver, Claims claims, Payload payload) {
-
-        Assert.notNull(resolver, "SigningKeyResolver instance cannot be null.");
-
+    /**
+     * Starts a single JWS verification policy transaction: the protected header, the {@code alg} header value and
+     * the {@link SecureDigestAlgorithm} it selects are captured together exactly once, before any key is located
+     * or any signature is verified.  The returned context is the only source of the algorithm, key and signature
+     * that may be used to construct the final {@code Jws}.
+     */
+    private JwsVerificationContext newJwsVerificationContext(final TokenizedJwt tokenized, final JwsHeader jwsHeader,
+                                                             final String alg) {
         SecureDigestAlgorithm<?, Key> algorithm;
         try {
             algorithm = (SecureDigestAlgorithm<?, Key>) sigAlgs.apply(jwsHeader);
@@ -280,6 +349,19 @@ public class DefaultJwtParser extends AbstractParser<Jwt<?, ?>> implements JwtPa
             throw new SignatureException(msg, e);
         }
         Assert.stateNotNull(algorithm, "JWS Signature Algorithm cannot be null.");
+        return new JwsVerificationContext(tokenized, jwsHeader, algorithm);
+    }
+
+    private byte[] verifySignature(final JwsVerificationContext context,
+                                   @SuppressWarnings("deprecation") SigningKeyResolver resolver, Claims claims, Payload payload) {
+
+        Assert.notNull(resolver, "SigningKeyResolver instance cannot be null.");
+
+        final TokenizedJwt tokenized = context.tokenized;
+        final JwsHeader jwsHeader = context.header;
+        // The algorithm was resolved exactly once, when the verification transaction was created.  It is never
+        // re-resolved here, so a stateful registry or a changed header cannot swap algorithms mid-verification:
+        final SecureDigestAlgorithm<?, Key> algorithm = context.algorithm;
 
         //digitally signed, let's assert the signature:
         Key key;
@@ -298,6 +380,7 @@ public class DefaultJwtParser extends AbstractParser<Jwt<?, ?>> implements JwtPa
         if (key instanceof PrivateKey) {
             throw new InvalidKeyException(PRIV_KEY_VERIFY_MSG);
         }
+        context.setKey(key); // bind the located key to this verification transaction
 
         final byte[] signature = decode(tokenized.getDigest(), "JWS signature");
 
@@ -355,6 +438,8 @@ public class DefaultJwtParser extends AbstractParser<Jwt<?, ?>> implements JwtPa
         } finally {
             Streams.reset(payloadStream);
         }
+
+        context.setSignature(signature); // bind the verified signature to this verification transaction
 
         return signature;
     }
@@ -489,6 +574,7 @@ public class DefaultJwtParser extends AbstractParser<Jwt<?, ?>> implements JwtPa
 
         byte[] iv = null;
         byte[] digest = null; // either JWE AEAD tag or JWS signature after Base64Url-decoding
+        JwsVerificationContext jwsContext = null;
         if (tokenized instanceof TokenizedJwe) {
 
             TokenizedJwe tokenizedJwe = (TokenizedJwe) tokenized;
@@ -574,7 +660,11 @@ public class DefaultJwtParser extends AbstractParser<Jwt<?, ?>> implements JwtPa
             // not using a signing key resolver, so we can verify the signature before reading the payload, which is
             // always safer:
             JwsHeader jwsHeader = Assert.stateIsInstance(JwsHeader.class, header, "Not a JwsHeader. ");
-            digest = verifySignature(tokenized, jwsHeader, alg, new LocatingKeyResolver(this.keyLocator), null, payload);
+            // Capture the compact token, protected header, 'alg' value and selected algorithm instance before any
+            // key lookup or verification work.  Everything used to produce the returned Jws must come from this
+            // one snapshot:
+            jwsContext = newJwsVerificationContext(tokenized, jwsHeader, alg);
+            digest = verifySignature(jwsContext, new LocatingKeyResolver(this.keyLocator), null, payload);
             integrityVerified = true; // no exception means signature verified
         }
 
@@ -645,7 +735,8 @@ public class DefaultJwtParser extends AbstractParser<Jwt<?, ?>> implements JwtPa
             // A SigningKeyResolver has been configured, and due to it's API, we have to verify the signature after
             // parsing the body.  This can be a security risk, so it needs to be removed before 1.0
             JwsHeader jwsHeader = Assert.stateIsInstance(JwsHeader.class, header, "Not a JwsHeader. ");
-            digest = verifySignature(tokenized, jwsHeader, alg, this.signingKeyResolver, claims, payload);
+            jwsContext = newJwsVerificationContext(tokenized, jwsHeader, alg);
+            digest = verifySignature(jwsContext, this.signingKeyResolver, claims, payload);
             //noinspection UnusedAssignment
             integrityVerified = true; // no exception means verified successfully
         }
@@ -655,8 +746,8 @@ public class DefaultJwtParser extends AbstractParser<Jwt<?, ?>> implements JwtPa
         if (header instanceof JweHeader) {
             jwt = new DefaultJwe<>((JweHeader) header, body, iv, digest);
         } else if (hasDigest) {
-            JwsHeader jwsHeader = Assert.isInstanceOf(JwsHeader.class, header, "JwsHeader required.");
-            jwt = new DefaultJws<>(jwsHeader, body, digest, base64UrlDigest.toString());
+            Assert.stateNotNull(jwsContext, "internal error: JWS verification context is missing.");
+            jwt = jwsContext.toJws(body);
         } else {
             //noinspection rawtypes
             jwt = new DefaultJwt(header, body);

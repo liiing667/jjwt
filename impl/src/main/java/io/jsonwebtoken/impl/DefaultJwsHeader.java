@@ -21,6 +21,10 @@ import io.jsonwebtoken.impl.lang.Parameters;
 import io.jsonwebtoken.lang.Collections;
 import io.jsonwebtoken.lang.Registry;
 
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.Map;
 import java.util.Set;
 
@@ -32,8 +36,41 @@ public class DefaultJwsHeader extends DefaultProtectedHeader implements JwsHeade
 
     static final Registry<String, Parameter<?>> PARAMS = Parameters.registry(DefaultProtectedHeader.PARAMS, B64);
 
+    /**
+     * Creates an immutable JWS header from the specified values.
+     *
+     * <p>The values are copied before they are converted to their idiomatic Java values.  In particular, mutable
+     * values such as {@code byte[]} arrays are copied so a caller cannot change a header after it has been used
+     * to select a key or verify a JWS.  A parsed header and all of its readers therefore always describe the same
+     * header generation.</p>
+     *
+     * @param map the header values
+     */
     public DefaultJwsHeader(Map<String, ?> map) {
-        super(PARAMS, map);
+        super(PARAMS, copy(map));
+    }
+
+    private static Map<String, ?> copy(Map<String, ?> map) {
+        if (map == null) {
+            return null;
+        }
+        Map<String, Object> copy = new LinkedHashMap<>(map.size());
+        for (Map.Entry<String, ?> entry : map.entrySet()) {
+            Object value = entry.getValue();
+            if (value instanceof byte[]) {
+                value = ((byte[]) value).clone();
+            } else if (value instanceof Set) {
+                value = new LinkedHashSet<>((Set<?>) value);
+            } else if (value instanceof Collection) {
+                value = new ArrayList<>((Collection<?>) value);
+            } else if (value instanceof Map) {
+                value = new LinkedHashMap<>((Map<?, ?>) value);
+            } else if (value instanceof Object[]) {
+                value = ((Object[]) value).clone();
+            }
+            copy.put(entry.getKey(), value);
+        }
+        return copy;
     }
 
     @Override

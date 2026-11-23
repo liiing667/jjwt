@@ -17,6 +17,7 @@ package io.jsonwebtoken.impl;
 
 import io.jsonwebtoken.JweHeader;
 import io.jsonwebtoken.impl.lang.Parameter;
+import io.jsonwebtoken.lang.Collections;
 import io.jsonwebtoken.security.PublicJwk;
 
 import java.net.URI;
@@ -79,7 +80,8 @@ public class DefaultMutableJweHeader extends DefaultJweHeaderMutator<DefaultMuta
 
     @Override
     public Set<String> getCritical() {
-        return get(DefaultProtectedHeader.CRIT);
+        Set<String> crit = get(DefaultProtectedHeader.CRIT);
+        return crit == null ? null : Collections.asSet(crit);
     }
 
     // =============================================================

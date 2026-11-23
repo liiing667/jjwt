@@ -22,6 +22,7 @@ import io.jsonwebtoken.impl.lang.Parameters;
 import io.jsonwebtoken.impl.security.AbstractAsymmetricJwk;
 import io.jsonwebtoken.impl.security.AbstractJwk;
 import io.jsonwebtoken.impl.security.JwkConverter;
+import io.jsonwebtoken.lang.Collections;
 import io.jsonwebtoken.lang.Registry;
 import io.jsonwebtoken.lang.Strings;
 import io.jsonwebtoken.security.PublicJwk;
@@ -115,6 +116,20 @@ public class DefaultProtectedHeader extends DefaultHeader implements ProtectedHe
 
     @Override
     public Set<String> getCritical() {
-        return get(CRIT);
+        // Header instances are immutable.  Return an unmodifiable view so a consumer cannot add or remove a critical
+        // requirement after parsing/building, which would otherwise let the final Jwt's critical set diverge from the
+        // header values and support decision used to create it.
+        Set<String> crit = get(CRIT);
+        return crit == null ? null : Collections.asSet(crit);
+    }
+
+    @SuppressWarnings("unchecked")
+    @Override
+    public Object get(Object key) {
+        Object value = super.get(key);
+        if (CRIT.getId().equals(key) && value instanceof Set) {
+            return Collections.immutable((Set<String>) value);
+        }
+        return value;
     }
 }

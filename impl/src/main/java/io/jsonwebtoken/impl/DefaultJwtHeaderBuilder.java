@@ -20,6 +20,7 @@ import io.jsonwebtoken.Jwts;
 import io.jsonwebtoken.lang.Collections;
 
 import java.util.LinkedHashSet;
+import java.util.Map;
 import java.util.Set;
 
 /**
@@ -27,12 +28,54 @@ import java.util.Set;
  */
 public class DefaultJwtHeaderBuilder extends DefaultJweHeaderBuilder<Jwts.HeaderBuilder> implements Jwts.HeaderBuilder {
 
+    /**
+     * {@code true} when this builder is a snapshot/migration of existing header state (for example the copy used by
+     * {@link DefaultJwtBuilder} immediately before creating a token).  In that mode every critical name must survive
+     * the header build so a later parser can reject names it does not support or header parameters that are absent.
+     * Silently removing such names would turn an unsupported critical extension into a token that appears to have
+     * handled it.
+     */
+    private final boolean preserveCrit;
+
+    /**
+     * {@code true} when a {@code crit} value was supplied through the generic map API (for example when migrating an
+     * existing header map) instead of through the {@link #critical()} mutator.  A migrated critical set is treated as
+     * authoritative: it is never silently reduced during {@link #build()}.
+     */
+    private boolean migratedCrit;
+
     public DefaultJwtHeaderBuilder() {
         super();
+        this.preserveCrit = false;
     }
 
     public DefaultJwtHeaderBuilder(DefaultJweHeaderMutator<?> src) {
         super(src);
+        this.preserveCrit = true;
+    }
+
+    private static boolean isCrit(String name) {
+        return DefaultProtectedHeader.CRIT.getId().equals(name);
+    }
+
+    @Override
+    public Object put(String name, Object value) {
+        if (isCrit(name)) {
+            this.migratedCrit = true;
+        }
+        return super.put(name, value);
+    }
+
+    @Override
+    public void putAll(Map<? extends String, ?> m) {
+        if (m != null && m.containsKey(DefaultProtectedHeader.CRIT.getId())) {
+            this.migratedCrit = true;
+        }
+        super.putAll(m);
+    }
+
+    private boolean preserveCrit() {
+        return this.preserveCrit || this.migratedCrit;
     }
 
     // Per https://www.rfc-editor.org/rfc/rfc7515.html#section-4.1.11 and
@@ -40,13 +83,34 @@ public class DefaultJwtHeaderBuilder extends DefaultJweHeaderBuilder<Jwts.Header
     //
     // 1. Any header parameter names defined in the JWS or JWE specifications
     // 2. Any header parameter names that are not included in the final header
-    private static ParameterMap sanitizeCrit(ParameterMap m, boolean protectedHeader) {
+    private ParameterMap sanitizeCrit(ParameterMap m, boolean protectedHeader) {
         Set<String> crit = m.get(DefaultProtectedHeader.CRIT);
         if (crit == null) return m; // nothing to do
 
         //Use a copy constructor to ensure subsequent changes to builder state do not change the constructed header:
         m = new ParameterMap(DefaultJweHeader.PARAMS, m, true);
         m.remove(DefaultProtectedHeader.CRIT.getId()); // remove the unsanitized value
+
+        // A migrated critical set is evidence supplied by an existing header and extension names must not be silently
+        // filtered: otherwise an unsupported critical extension could be dropped while creating the migrated token,
+        // and a subsequent parse would incorrectly appear to have handled it.  Keep every extension name attached to
+        // the header so a parser can enforce it (or reject it) using this same header data.
+        if (preserveCrit()) {
+            Set<String> preserved = new LinkedHashSet<>(crit);
+            if (protectedHeader) {
+                // Names defined by the JWS/JWE specifications are never valid crit values.  This is the only
+                // filtering retained during migration; all extension names (including unsupported ones) survive.
+                for (String val : crit) {
+                    if (DefaultJweHeader.PARAMS.containsKey(val)) {
+                        preserved.remove(val);
+                    }
+                }
+            }
+            if (!Collections.isEmpty(preserved)) {
+                m.put(DefaultProtectedHeader.CRIT, preserved);
+            }
+            return m;
+        }
 
         // Per https://www.rfc-editor.org/rfc/rfc7515.html#section-4.1.11, non-protected headers are not allowed to
         // have a 'crit' header parameter, so we're done, exit early:

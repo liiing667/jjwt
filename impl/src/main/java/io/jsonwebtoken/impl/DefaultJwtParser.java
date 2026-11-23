@@ -212,6 +212,48 @@ public class DefaultJwtParser extends AbstractParser<Jwt<?, ?>> implements JwtPa
 
     private final long allowedClockSkewMillis;
 
+    /**
+     * Immutable snapshot of everything that participates in {@code crit} enforcement for one parse invocation: the
+     * protected header (and therefore its exact header values), the header's declared critical names, and the parser's
+     * explicitly-supported critical names.  Validation and the resulting {@link Jwt} both use this same snapshot, so
+     * a retry, a mutable header value, or a concurrently-modified parser/builder collection cannot cause a critical
+     * name to be treated as handled by one part of parsing while being absent from another.
+     */
+    private static final class CritTransaction {
+
+        private final Header header;
+        private final Set<String> critical;
+        private final Set<String> supported;
+
+        private CritTransaction(ProtectedHeader header, Set<String> supportedCrit, boolean autoSupportB64) {
+            this.header = header;
+            this.critical = Collections.asSet(Collections.nullSafe(header.getCritical()));
+
+            Set<String> supported = new LinkedHashSet<>();
+            if (autoSupportB64) {
+                // The application explicitly supplied an unencoded payload, so it wants B64 support even if it
+                // forgot to configure it on the parser builder:
+                supported.add(DefaultJwsHeader.B64.getId());
+            }
+            supported.addAll(Collections.nullSafe(supportedCrit));
+            this.supported = Collections.asSet(supported);
+        }
+
+        private void validate() {
+            // Assert any values per https://www.rfc-editor.org/rfc/rfc7515.html#section-4.1.11:
+            for (String name : this.critical) {
+                if (!this.header.containsKey(name)) {
+                    String msg = String.format(CRIT_MISSING_MSG, name, name, this.header);
+                    throw new MalformedJwtException(msg);
+                }
+                if (!this.supported.contains(name)) {
+                    String msg = String.format(CRIT_UNSUPPORTED_MSG, name, name, this.header);
+                    throw new UnsupportedJwtException(msg);
+                }
+            }
+        }
+    }
+
     //SigningKeyResolver will be removed for 1.0:
     @SuppressWarnings("deprecation")
     DefaultJwtParser(Provider provider,
@@ -236,7 +278,9 @@ public class DefaultJwtParser extends AbstractParser<Jwt<?, ?>> implements JwtPa
         this.signingKeyResolver = signingKeyResolver;
         this.keyLocator = Assert.notNull(keyLocator, "Key Locator cannot be null.");
         this.clock = Assert.notNull(clock, "Clock cannot be null.");
-        this.critical = Collections.nullSafe(critical);
+        // Capture the supported critical capability at construction time.  Later changes to the builder's collection
+        // must not alter a parser that has already been created:
+        this.critical = Collections.asSet(Collections.nullSafe(critical));
         this.allowedClockSkewMillis = allowedClockSkewMillis;
         this.expectedClaims = Jwts.claims().add(expectedClaims);
         this.decoder = Assert.notNull(base64UrlDecoder, "base64UrlDecoder cannot be null.");
@@ -427,28 +471,12 @@ public class DefaultJwtParser extends AbstractParser<Jwt<?, ?>> implements JwtPa
         }
         // ----- crit assertions -----
         if (header instanceof ProtectedHeader) {
-            Set<String> crit = Collections.nullSafe(((ProtectedHeader) header).getCritical());
-            Set<String> supportedCrit = this.critical;
             String b64Id = DefaultJwsHeader.B64.getId();
-            if (!unencodedPayload.isEmpty() && !this.critical.contains(b64Id)) {
-                // The application developer explicitly indicates they're using a B64 payload, so
-                // ensure that the B64 crit header is supported, even if they forgot to configure it on the
-                // parser builder:
-                supportedCrit = new LinkedHashSet<>(Collections.size(this.critical) + 1);
-                supportedCrit.add(DefaultJwsHeader.B64.getId());
-                supportedCrit.addAll(this.critical);
-            }
-            // assert any values per https://www.rfc-editor.org/rfc/rfc7515.html#section-4.1.11:
-            for (String name : crit) {
-                if (!header.containsKey(name)) {
-                    String msg = String.format(CRIT_MISSING_MSG, name, name, header);
-                    throw new MalformedJwtException(msg);
-                }
-                if (!supportedCrit.contains(name)) {
-                    String msg = String.format(CRIT_UNSUPPORTED_MSG, name, name, header);
-                    throw new UnsupportedJwtException(msg);
-                }
-            }
+            // The application developer explicitly indicates they're using a B64 payload, so ensure that the B64
+            // crit header is supported, even if they forgot to configure it on the parser builder.  The complete
+            // snapshot is validated once below and then retained by the resulting Jwt's header:
+            boolean autoSupportB64 = !unencodedPayload.isEmpty() && !this.critical.contains(b64Id);
+            new CritTransaction((ProtectedHeader) header, this.critical, autoSupportB64).validate();
         }
 
         // =============== Payload =================
